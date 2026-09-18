@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+DIR="$(dirname "$(realpath "$0")")"
+exec "$DIR/venv/bin/python" "$DIR/vestctl.py" "$@"

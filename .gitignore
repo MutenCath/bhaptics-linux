@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+reference/
+sdk2_cache/
+mapping.json
+audio_settings.json
+audio_presets.json
+effects.json
+*.pem
+*.log
