@@ -15,10 +15,15 @@ arg="${1:?usage: $0 <steam-appid | path-to-pfx>}"
 
 if [[ "$arg" =~ ^[0-9]+$ ]]; then
   pfx=""
-  for lib in "$HOME/.steam/steam" "$HOME/.local/share/Steam" \
-             "$HOME"/.steam/steam/steamapps/../../../*/SteamLibrary; do
-    cand="$lib/steamapps/compatdata/$arg/pfx"
-    [ -d "$cand" ] && pfx="$cand" && break
+  # every Steam library is listed in libraryfolders.vdf; check them all
+  for steamroot in "$HOME/.steam/steam" "$HOME/.local/share/Steam" \
+                   "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+    vdf="$steamroot/steamapps/libraryfolders.vdf"
+    [ -f "$vdf" ] || continue
+    while IFS= read -r lib; do
+      cand="$lib/steamapps/compatdata/$arg/pfx"
+      [ -d "$cand" ] && pfx="$cand" && break 2
+    done < <(grep -oP '"path"\s+"\K[^"]+' "$vdf")
   done
   [ -n "$pfx" ] || { echo "compatdata for appid $arg not found — run the game once first"; exit 1; }
 else

@@ -19,10 +19,13 @@ import contextlib
 import http
 import json
 import logging
+import os
 import re
+import shutil
 import signal
 import struct
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -31,11 +34,42 @@ import numpy as np
 import websockets
 from bleak import BleakClient, BleakScanner
 
+try:
+    import evdev
+    from evdev import ecodes as EC
+except ImportError:  # pad mirror simply stays unavailable
+    evdev = None
+
 log = logging.getLogger("bhaptics-daemon")
 
 BASE_DIR = Path(__file__).resolve().parent
-MAPPING_FILE = BASE_DIR / "mapping.json"
 UI_FILE = BASE_DIR / "ui.html"
+
+# user files live in XDG dirs so the daemon can run from a read-only install
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
+                                 Path.home() / ".config")) / "bhaptics-linux"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                                Path.home() / ".local/state")) / "bhaptics-linux"
+MAPPING_FILE = CONFIG_DIR / "mapping.json"
+PATTERNS_DIR = CONFIG_DIR / "patterns"
+
+
+def migrate_legacy_state():
+    """One-time move of state files from the repo dir (pre-XDG layout)."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    moves = [
+        (BASE_DIR / n, CONFIG_DIR / n)
+        for n in ("mapping.json", "audio_settings.json", "audio_presets.json",
+                  "effects.json", "patterns")
+    ] + [
+        (BASE_DIR / n, STATE_DIR / n)
+        for n in ("sdk2_cache", "sdk2_cert.pem", "sdk2_key.pem")
+    ]
+    for old, new in moves:
+        if old.exists() and not new.exists():
+            shutil.move(str(old), str(new))
+            log.info("migrated %s -> %s", old.name, new)
 
 VEST_NAME_PREFIXES = ("TactSuit", "Tactot")
 MOTOR_STABLE = "6e40000a-b5a3-f393-e0a9-e50e24dcca9e"
@@ -275,6 +309,13 @@ class OscProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         for address, args in parse_osc(data):
+            if address == "/vest/tap":
+                # generic-profile rumble (VestRumble plugin / scripts);
+                # deliberately does NOT count as a haptics client, so
+                # audio mode keeps running alongside
+                with contextlib.suppress(Exception):
+                    self.state.vest_tap(args)
+                continue
             m = OSC_RE.match(address)
             if not m or not args:
                 continue
@@ -353,14 +394,17 @@ class VestLink:
             self.last_sent = data
         except Exception as e:
             log.warning("BLE write failed: %s", e)
-            self.client = None
+            dead, self.client = self.client, None
+            # release the BlueZ connection so the reconnect scan can find the vest
+            with contextlib.suppress(Exception):
+                await dead.disconnect()
 
 
 AUDIO_RATE = 48000
 AUDIO_CHUNK = 960  # 20 ms
-AUDIO_CONF = BASE_DIR / "audio_settings.json"
-PRESETS_FILE = BASE_DIR / "audio_presets.json"
-EFFECTS_FILE = BASE_DIR / "effects.json"
+AUDIO_CONF = CONFIG_DIR / "audio_settings.json"
+PRESETS_FILE = CONFIG_DIR / "audio_presets.json"
+EFFECTS_FILE = CONFIG_DIR / "effects.json"
 OSC_PORT = 9001  # VRChat sends avatar parameters here
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
 
@@ -373,6 +417,10 @@ class AudioEngine:
         self.stereo = True
         self.level_l = 0.0
         self.level_r = 0.0
+        # per-band outputs when spread mode is on: [sub, bass, lowmid]
+        self.band_l = [0.0, 0.0, 0.0]
+        self.band_r = [0.0, 0.0, 0.0]
+        self.spread = False  # map bands to vest rows (low = belly, mid = chest)
         self.rel = 0.0  # relative loudness 0..1, for the UI meter
         self.thresh = 0.55
         self.gain = 4.0  # sensitivity: higher -> lower beat threshold
@@ -388,6 +436,8 @@ class AudioEngine:
         self._proc = None
         self.source = "default"
         self.start_enabled = True
+        self.auto_profiles = True
+        self.pad_mirror = False
         if AUDIO_CONF.exists():
             with contextlib.suppress(Exception):
                 c = json.loads(AUDIO_CONF.read_text())
@@ -400,6 +450,9 @@ class AudioEngine:
                 self.impact = bool(c.get("impact", True))
                 self.impact_gain = float(c.get("impGain", self.impact_gain))
                 self.impact_max = int(c.get("impMax", self.impact_max))
+                self.auto_profiles = bool(c.get("auto", True))
+                self.spread = bool(c.get("spread", False))
+                self.pad_mirror = bool(c.get("pad", False))
         # legacy raw stream indexes don't survive reboots (appname: does)
         if self.source.startswith("app:"):
             self.source = "default"
@@ -410,7 +463,8 @@ class AudioEngine:
                 "max": self.max_level, "stereo": self.stereo,
                 "enabled": self.enabled, "source": self.source,
                 "impact": self.impact, "impGain": self.impact_gain,
-                "impMax": self.impact_max}
+                "impMax": self.impact_max, "auto": self.auto_profiles,
+                "spread": self.spread, "pad": self.pad_mirror}
 
     async def set_enabled(self, on):
         if on and not self.enabled:
@@ -425,6 +479,8 @@ class AudioEngine:
             self._stop_proc()
             self.level_l = self.level_r = self.rel = 0.0
             self.impact_l = self.impact_r = 0.0
+            self.band_l = [0.0, 0.0, 0.0]
+            self.band_r = [0.0, 0.0, 0.0]
             self.waiting = False
             log.info("audio mode OFF")
 
@@ -487,38 +543,53 @@ class AudioEngine:
             await asyncio.sleep(1)
 
     async def _pump(self):
-        sm_l = sm_r = 0.0
+        n_bands = 3  # sub (~25-75 Hz), bass (~75-125), lowmid (~125-275)
+        sm_l = [0.0] * n_bands
+        sm_r = [0.0] * n_bands
         peak = 1e-3
         hf_base_l = hf_base_r = 0.0
         hf_peak = 1e-3
         imp_l = imp_r = 0.0
-        bin_hz = AUDIO_RATE / AUDIO_CHUNK
-        bass_hi = max(2, int(self.bass_hz / bin_hz))
+        bin_hz = AUDIO_RATE / AUDIO_CHUNK  # 50 Hz per FFT bin
+        band_edges = [(1, 2), (2, 3), (3, 6)]
         hf_lo, hf_hi = int(1000 / bin_hz), int(10000 / bin_hz)
 
         def bands(ch):
             spectrum = np.abs(np.fft.rfft(ch))
             norm = np.sqrt(AUDIO_CHUNK)
-            bass = float(np.sqrt(np.mean(spectrum[1:bass_hi] ** 2)) / norm)
+            lows = [float(np.sqrt(np.mean(spectrum[a:b] ** 2)) / norm)
+                    for a, b in band_edges]
             hf = float(np.sqrt(np.mean(spectrum[hf_lo:hf_hi] ** 2)) / norm)
-            return bass, hf
+            return lows, hf
 
         frame_bytes = AUDIO_CHUNK * 4
+        buf = bytearray()
         try:
             while True:
-                data = await self._proc.stdout.readexactly(frame_bytes)
-                # drop backlog: any stall would otherwise leave stale audio
-                # queued in the pipe forever, turning into permanent delay
-                while len(self._proc.stdout._buffer) >= frame_bytes:
-                    data = await self._proc.stdout.readexactly(frame_bytes)
+                chunk = await self._proc.stdout.read(65536)
+                if not chunk:
+                    log.info("audio stream ended, will rebind")
+                    self.level_l = self.level_r = self.rel = 0.0
+                    self.impact_l = self.impact_r = 0.0
+                    self.band_l = [0.0, 0.0, 0.0]
+                    self.band_r = [0.0, 0.0, 0.0]
+                    return
+                buf += chunk
+                if len(buf) < frame_bytes:
+                    continue
+                # keep only the newest complete frame: a stall would otherwise
+                # leave stale audio queued forever, turning into permanent delay
+                n = len(buf) // frame_bytes
+                data = bytes(buf[(n - 1) * frame_bytes:n * frame_bytes])
+                del buf[:n * frame_bytes]
                 samples = (
                     np.frombuffer(data, dtype=np.int16)
                     .reshape(-1, 2).astype(np.float32) / 32768.0
                 )
-                e_l, hf_l = bands(samples[:, 0])
-                e_r, hf_r = bands(samples[:, 1])
+                lows_l, hf_l = bands(samples[:, 0])
+                lows_r, hf_r = bands(samples[:, 1])
                 if not self.stereo:
-                    e_l = e_r = max(e_l, e_r)
+                    lows_l = lows_r = [max(a, b) for a, b in zip(lows_l, lows_r)]
                     hf_l = hf_r = max(hf_l, hf_r)
 
                 # impacts: HF onsets (sword hits, gunshots) vs a slow baseline
@@ -540,13 +611,15 @@ class AudioEngine:
                 self.impact_l = imp_l if imp_l > 0.03 else 0.0
                 self.impact_r = imp_r if imp_r > 0.03 else 0.0
 
-                # bass rumble: fast attack, slower release envelopes
-                sm_l = max(e_l, sm_l * 0.90)
-                sm_r = max(e_r, sm_r * 0.90)
-                loud = max(sm_l, sm_r)
+                # bass rumble: fast attack, slower release envelopes, per band
+                sm_l = [max(e, s * 0.90) for e, s in zip(lows_l, sm_l)]
+                sm_r = [max(e, s * 0.90) for e, s in zip(lows_r, sm_r)]
+                loud = max(*sm_l, *sm_r)
                 self.thresh = min(0.9, max(0.06, 0.9 - 0.09 * self.gain))
                 if loud < self.floor:
                     self.level_l = self.level_r = self.rel = 0.0
+                    self.band_l = [0.0] * n_bands
+                    self.band_r = [0.0] * n_bands
                     continue
                 # slow-decaying loudness reference: react to *relative* loudness
                 # so only the louder beats thump instead of a constant buzz
@@ -561,22 +634,181 @@ class AudioEngine:
                         self.max_level / 15.0
                     )
 
-                self.level_l, self.level_r = out(sm_l), out(sm_r)
+                self.band_l = [out(s) for s in sm_l]
+                self.band_r = [out(s) for s in sm_r]
+                self.level_l = max(self.band_l)
+                self.level_r = max(self.band_r)
         except asyncio.CancelledError:
             self.level_l = self.level_r = self.rel = 0.0
             self.impact_l = self.impact_r = 0.0
+            self.band_l = [0.0, 0.0, 0.0]
+            self.band_r = [0.0, 0.0, 0.0]
             raise
-        except asyncio.IncompleteReadError:
-            log.info("audio stream ended, will rebind")
-            self.level_l = self.level_r = self.rel = 0.0
-            self.impact_l = self.impact_r = 0.0
         except Exception as e:
             log.warning("audio capture error (will retry): %s", e)
             self.level_l = self.level_r = self.rel = 0.0
             self.impact_l = self.impact_r = 0.0
+            self.band_l = [0.0, 0.0, 0.0]
+            self.band_r = [0.0, 0.0, 0.0]
 
 
-SDK2_CACHE = BASE_DIR / "sdk2_cache"
+def list_audio_apps():
+    """Apps currently playing audio: lowercased name -> original name."""
+    try:
+        inputs = json.loads(subprocess.run(
+            ["pactl", "-f", "json", "list", "sink-inputs"],
+            capture_output=True, text=True).stdout)
+    except Exception:
+        return {}
+    out = {}
+    for si in inputs:
+        props = si.get("properties", {})
+        app = (props.get("application.name")
+               or props.get("application.process.binary") or "")
+        if app:
+            out.setdefault(app.lower(), app)
+    return out
+
+
+class PadMirror:
+    """Mirror gamepad force-feedback to the vest.
+
+    Grabs each FF-capable evdev gamepad and re-exposes it as a uinput clone;
+    the game rumbles the clone, we forward the effect to the real pad (so
+    controller rumble still works) and buzz the vest with the same envelope.
+    No game involvement at all — works for anything using evdev/SDL rumble.
+    """
+
+    def __init__(self, state):
+        self.state = state
+        self.enabled = False
+        self.tasks = {}  # dev path -> asyncio task
+        self.names = {}  # dev path -> device name
+        self._scan_task = None
+
+    async def set_enabled(self, on):
+        if on and not self.enabled:
+            if evdev is None:
+                log.warning("pad mirror: python-evdev not installed")
+                return
+            self.enabled = True
+            self._scan_task = asyncio.create_task(self._scan())
+            log.info("pad mirror ON")
+        elif not on and self.enabled:
+            self.enabled = False
+            self._scan_task.cancel()
+            for t in self.tasks.values():
+                t.cancel()
+            self.tasks.clear()
+            self.names.clear()
+            self.state.active.pop("pad", None)
+            log.info("pad mirror OFF")
+
+    async def _scan(self):
+        while True:
+            for path in evdev.list_devices():
+                if path in self.tasks and not self.tasks[path].done():
+                    continue
+                try:
+                    dev = evdev.InputDevice(path)
+                    caps = dev.capabilities()
+                    if (EC.EV_FF not in caps or EC.FF_RUMBLE not in caps[EC.EV_FF]
+                            or "(vest)" in (dev.name or "")):
+                        dev.close()
+                        continue
+                except OSError:
+                    continue
+                self.names[path] = dev.name
+                self.tasks[path] = asyncio.create_task(self._mirror(path, dev))
+                log.info("pad mirror: attached to %s (%s)", dev.name, path)
+            for path, t in list(self.tasks.items()):
+                if t.done():
+                    self.tasks.pop(path)
+                    self.names.pop(path, None)
+            await asyncio.sleep(4)
+
+    async def _mirror(self, path, dev):
+        ui = None
+        loop = asyncio.get_running_loop()
+        phys_ids = {}    # clone effect id -> physical effect id
+        magnitudes = {}  # clone effect id -> (amp 0..1, length_ms)
+        try:
+            dev.grab()
+            caps = dev.capabilities(absinfo=True)
+            caps.pop(EC.EV_SYN, None)
+            ui = evdev.UInput(caps, name=f"{dev.name} (vest)",
+                              vendor=dev.info.vendor, product=dev.info.product,
+                              version=dev.info.version, bustype=dev.info.bustype)
+
+            def effect_amp(eff):
+                try:
+                    if eff.type == EC.FF_RUMBLE:
+                        r = eff.u.ff_rumble_effect
+                        return max(r.strong_magnitude, r.weak_magnitude) / 0xFFFF
+                    if eff.type == EC.FF_PERIODIC:
+                        return abs(eff.u.ff_periodic_effect.magnitude) / 0x7FFF
+                except Exception:
+                    pass
+                return 0.5
+
+            def on_clone_readable():
+                while True:
+                    ev = ui.read_one()
+                    if ev is None:
+                        return
+                    if ev.type == EC.EV_UINPUT and ev.code == EC.UI_FF_UPLOAD:
+                        upload = ui.begin_upload(ev.value)
+                        eff = upload.effect
+                        local_id = eff.id
+                        length = getattr(eff.replay, "length", 300) or 300
+                        magnitudes[local_id] = (effect_amp(eff), int(length))
+                        with contextlib.suppress(Exception):
+                            eff.id = phys_ids.get(local_id, -1)
+                            phys_ids[local_id] = dev.upload_effect(eff)
+                        upload.retval = 0
+                        ui.end_upload(upload)
+                    elif ev.type == EC.EV_UINPUT and ev.code == EC.UI_FF_ERASE:
+                        erase = ui.begin_erase(ev.value)
+                        pid = phys_ids.pop(erase.effect_id, None)
+                        if pid is not None:
+                            with contextlib.suppress(Exception):
+                                dev.erase_effect(pid)
+                        magnitudes.pop(erase.effect_id, None)
+                        erase.retval = 0
+                        ui.end_erase(erase)
+                    elif ev.type == EC.EV_FF:
+                        pid = phys_ids.get(ev.code)
+                        if pid is not None:
+                            with contextlib.suppress(Exception):
+                                dev.write(EC.EV_FF, pid, ev.value)
+                        amp, ms = magnitudes.get(ev.code, (0.5, 300))
+                        if ev.value > 0:
+                            self.state.pad_rumble(amp, ms)
+                        else:
+                            self.state.active.pop("pad", None)
+
+            loop.add_reader(ui.fd, on_clone_readable)
+            try:
+                async for ev in dev.async_read_loop():
+                    ui.write_event(ev)
+            finally:
+                loop.remove_reader(ui.fd)
+        except asyncio.CancelledError:
+            pass
+        except OSError as e:
+            log.warning("pad mirror %s failed: %s (need /dev/uinput access?)", path, e)
+        finally:
+            with contextlib.suppress(Exception):
+                dev.ungrab()
+            with contextlib.suppress(Exception):
+                dev.close()
+            if ui is not None:
+                with contextlib.suppress(Exception):
+                    ui.close()
+            log.info("pad mirror: detached from %s", path)
+
+
+SDK2_CACHE = STATE_DIR / "sdk2_cache"
 SDK2_DEFS_URL = (
     "https://sdk-apis.bhaptics.com/api/v1/haptic-definitions/workspace/latest"
     "?workspace-id={wid}&api-key={key}&last-version=0"
@@ -669,12 +901,63 @@ class PlayerState:
                 self.effects = json.loads(EFFECTS_FILE.read_text())
         self.osc_front = [0.0] * 20
         self.osc_back = [0.0] * 20
-        self.osc_last = 0.0
+        # -inf, not 0: right after boot monotonic() is near 0 and 0.0 would
+        # read as "OSC seen seconds ago", muting audio mode for no reason
+        self.osc_last = float("-inf")
+        self.sdk2_events = {}  # eventName -> project dict
+        self.auto_profile_app = ""  # display name while an auto profile is active
+        self.pad = PadMirror(self)
+        self.patterns = set()  # keys loaded from patterns/*.tact (persisted)
+        self.missing_keys = {}  # names games asked for but we don't have
+        self.import_note = ""
+        self._load_sdk2_cache()
+        self._load_patterns()  # after cache: explicit imports win over cache
+
+    def add_pattern(self, name, project, save=True):
+        """Register a pattern under both SDK1 (submit-by-key) and SDK2
+        (SdkPlay event name), optionally persisting it to patterns/."""
+        if save:
+            PATTERNS_DIR.mkdir(parents=True, exist_ok=True)
+            (PATTERNS_DIR / f"{name}.tact").write_text(json.dumps(project))
+        self.registered[name] = project
+        self.patterns.add(name)
+        self.sdk2_events[name] = project
+        self.missing_keys.pop(name, None)
+
+    def _note_missing(self, name):
+        if not name:
+            return
+        self.missing_keys[str(name)] = time.time()
+        while len(self.missing_keys) > 30:
+            self.missing_keys.pop(next(iter(self.missing_keys)))
+
+    def _load_patterns(self):
+        """Pre-register patterns/*.tact so mods that submit by key without
+        registering first (expecting Player-installed defaults) still work."""
+        for f in sorted(PATTERNS_DIR.glob("*.tact")):
+            try:
+                project = find_project(json.loads(f.read_text()))
+            except Exception as e:
+                log.warning("patterns: skipping %s: %s", f.name, e)
+                continue
+            if project is None:
+                log.warning("patterns: no Tracks found in %s", f.name)
+                continue
+            self.add_pattern(f.stem, project, save=False)
+        if self.patterns:
+            log.info("patterns: %d loaded from %s", len(self.patterns), PATTERNS_DIR)
+
+    def _load_sdk2_cache(self):
+        """Relearn SDK2 event definitions from previous sessions."""
+        for f in sorted(SDK2_CACHE.glob("*.json")):
+            with contextlib.suppress(Exception):
+                self.sdk2_events.update(extract_events(json.loads(f.read_text())))
+        if self.sdk2_events:
+            log.info("sdk2: %d events restored from cache", len(self.sdk2_events))
 
     @property
     def osc_active(self):
         return (time.monotonic() - self.osc_last) < 5.0
-        self.sdk2_events = {}  # eventName -> project dict (or None if unparseable)
 
     @property
     def audio_suppressed(self):
@@ -723,11 +1006,19 @@ class PlayerState:
                 "AudioImpMax": self.audio.impact_max,
                 "AudioSuppressed": self.audio_suppressed,
                 "AudioSource": self.audio.source,
+                "AudioAuto": self.audio.auto_profiles,
+                "AudioSpread": self.audio.spread,
+                "AutoProfileApp": self.auto_profile_app,
+                "PadMirror": self.audio.pad_mirror,
+                "PadDevices": sorted(self.pad.names.values()),
                 "Presets": sorted(self.presets.keys()),
                 "ActivePreset": self.active_preset,
                 "GameClients": sorted(set(self.game_clients.values()))
                 + (["VRChat (OSC)"] if self.osc_active else []),
                 "Effects": sorted(k for k in self.effects if not k.startswith("__")),
+                "Patterns": sorted(self.patterns),
+                "Sdk2Events": sorted(self.sdk2_events),
+                "MissingKeys": sorted(self.missing_keys),
                 "Battery": self.vest.battery,
             }
         )
@@ -738,6 +1029,7 @@ class PlayerState:
             project = reg.get("Project")
             if key and project:
                 self.registered[key] = project
+                self.missing_keys.pop(key, None)
                 log.info("registered %r", key)
 
         for sub in payload.get("Submit") or []:
@@ -760,6 +1052,7 @@ class PlayerState:
                 project = self.registered.get(params.get("altKey") or key)
                 if project is None:
                     log.warning("submit for unregistered key %r", key)
+                    self._note_missing(params.get("altKey") or key)
                     continue
                 timeline = compile_project(
                     project,
@@ -780,17 +1073,24 @@ class PlayerState:
             am = payload["AudioMode"]
             if isinstance(am, dict):
                 await self.apply_audio_settings(am)
-                self.active_preset = ""
-                enabled = bool(am.get("enabled", True))
+                if any(k not in ("auto", "enabled") for k in am):
+                    self.active_preset = ""
+                enabled = bool(am.get("enabled", self.audio.enabled))
             else:
                 enabled = bool(am)
             await self.audio.set_enabled(enabled)
+
+        if "PadMirror" in payload:
+            self.audio.pad_mirror = bool(payload["PadMirror"])
+            await self.pad.set_enabled(self.audio.pad_mirror)
 
         if "SavePreset" in payload:
             name = str(payload["SavePreset"]).strip()
             if name:
                 snap = self.audio.settings()
                 snap.pop("enabled", None)
+                snap.pop("auto", None)  # auto-profile is global, not per-preset
+                snap.pop("pad", None)   # pad mirror is global too
                 self.presets[name] = snap
                 self._save_presets()
                 self.active_preset = name
@@ -843,6 +1143,60 @@ class PlayerState:
             if self.effects.pop(str(payload["DeleteEffect"]), None) is not None:
                 self._save_effects()
 
+        if "ImportTact" in payload:
+            it = payload["ImportTact"] or {}
+            # strict name filter: it becomes a filename
+            clean = lambda n: re.sub(r"[^\w\- .]", "", str(n)).strip(". ")
+            name = clean(it.get("name", ""))
+            data = it.get("project")
+            # root-level Tracks = plain .tact; otherwise prefer the manifest
+            # parser (find_project would greedily grab the first embedded
+            # pattern of a multi-event manifest)
+            project = None
+            if isinstance(data, dict) and ("Tracks" in data or "tracks" in data):
+                project = data
+            elif not extract_events(data):
+                project = find_project(data)
+            if name and project is not None:
+                self.add_pattern(name, project)
+                self.import_note = f"imported pattern “{name}”"
+                log.info("pattern imported: %r", name)
+            else:
+                # not a single .tact — maybe an SDK2 definitions manifest
+                # (Unity/Unreal mods ship one JSON with many named events)
+                added = []
+                for ev, proj in extract_events(data).items():
+                    en = clean(ev)
+                    if en:
+                        self.add_pattern(en, proj)
+                        added.append(en)
+                if added:
+                    self.import_note = (
+                        f"“{name or 'manifest'}”: imported {len(added)} events — "
+                        + ", ".join(added[:8])
+                        + ("…" if len(added) > 8 else ""))
+                    log.info("manifest imported: %d events from %r", len(added), name)
+                else:
+                    self.import_note = f"“{name or 'file'}”: no haptic patterns found"
+                    log.info("ImportTact: nothing usable in %r", name)
+
+        if "DeletePattern" in payload:
+            name = str(payload["DeletePattern"])
+            if name in self.patterns:
+                self.patterns.discard(name)
+                self.registered.pop(name, None)
+                self.sdk2_events.pop(name, None)
+                with contextlib.suppress(OSError):
+                    (PATTERNS_DIR / f"{name}.tact").unlink()
+                log.info("pattern deleted: %r", name)
+
+        if "PlayEvent" in payload:
+            name = str(payload["PlayEvent"])
+            project = self.sdk2_events.get(name)
+            timeline = compile_project(project) if project is not None else []
+            if timeline:
+                self.active[f"sdk2ui:{name}"] = Effect(name, timeline)
+
     def _save_effects(self):
         with contextlib.suppress(OSError):
             EFFECTS_FILE.write_text(json.dumps(
@@ -857,6 +1211,8 @@ class PlayerState:
         a.impact = bool(d.get("impact", a.impact))
         a.impact_gain = float(d.get("impGain", a.impact_gain))
         a.impact_max = int(d.get("impMax", a.impact_max))
+        a.auto_profiles = bool(d.get("auto", a.auto_profiles))
+        a.spread = bool(d.get("spread", a.spread))
         new_src = str(d.get("source", a.source))
         if new_src != a.source:
             was_enabled = a.enabled
@@ -872,7 +1228,7 @@ class PlayerState:
     def ingest_sdk2_defs(self, data, source):
         if data is None:
             return
-        SDK2_CACHE.mkdir(exist_ok=True)
+        SDK2_CACHE.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         (SDK2_CACHE / f"{source}-{stamp}.json").write_text(
             json.dumps(data) if not isinstance(data, str) else data
@@ -954,6 +1310,7 @@ class PlayerState:
                 # unknown event: generic 250ms whole-vest pulse so the game
                 # still gives feedback; raw definition (if any) is in sdk2_cache/
                 log.info("sdk2: fallback pulse for event %r", name)
+                self._note_missing(name)
                 lvl = min(1.0, 0.45 * intensity)
                 ticks = max(1, int(250 * duration) // TICK_MS)
                 timeline = [("mapped", [lvl] * 20, [lvl] * 20)] * ticks
@@ -972,6 +1329,37 @@ class PlayerState:
         else:
             log.info("sdk2: unhandled message type %r, raw: %.300s",
                      mtype, json.dumps(payload))
+
+    def pad_rumble(self, amp, ms):
+        """Gamepad FF mirrored to belly/mid rows — rumble, not a tap."""
+        amp = min(1.0, max(0.0, float(amp)))
+        ms = min(4000, max(60, int(ms)))
+        if amp < 0.03:
+            return
+        front = [0.0] * 20
+        for i in range(8, 20):  # rows 2-4: mid + belly
+            front[i] = amp
+        timeline = [("mapped", front, front[:])] * max(1, ms // TICK_MS)
+        self.active["pad"] = Effect("pad", timeline)
+
+    def vest_tap(self, args):
+        """OSC /vest/tap <side> <amp 0-1> [ms] — a quick controller-rumble
+        style tap on the upper chest, weighted to the given side."""
+        side = str(args[0]).lower() if args else "both"
+        amp = min(1.0, max(0.0, float(args[1]))) if len(args) > 1 else 0.5
+        ms = min(2000, max(TICK_MS, int(args[2]))) if len(args) > 2 else 120
+        if amp < 0.02:
+            return
+        wl = (1.0, 0.67, 0.33, 0.0)  # col 0 = wearer's left
+        lv = amp if side in ("left", "both") else 0.0
+        rv = amp if side in ("right", "both") else 0.0
+        front = [0.0] * 20
+        for i in range(8):  # upper two rows, like audio impacts
+            w = wl[i % 4]
+            front[i] = lv * w + rv * (1 - w)
+        timeline = [("mapped", front, front[:])] * max(1, ms // TICK_MS)
+        key = f"tap:{side}"
+        self.active[key] = Effect(key, timeline)
 
     async def mixer(self):
         while True:
@@ -1008,9 +1396,17 @@ class PlayerState:
                 l, r = a.level_l, a.level_r
                 il, ir = a.impact_l, a.impact_r
                 wl = (1.0, 0.67, 0.33, 0.0)  # grid col 0 = wearer's left
+                # spread mode: frequency becomes vertical position —
+                # row 4 (belly) = sub, row 3 = bass, row 2 = lowmid
+                row_band = {4: 0, 3: 1, 2: 2}
                 for i in range(20):
                     w = wl[i % 4]
-                    lvl = l * w + r * (1 - w)
+                    if a.spread:
+                        bi = row_band.get(i // 4)
+                        lvl = (a.band_l[bi] * w + a.band_r[bi] * (1 - w)
+                               if bi is not None else 0.0)
+                    else:
+                        lvl = l * w + r * (1 - w)
                     front[i] = max(front[i], lvl)
                     back[i] = max(back[i], lvl)
                     if i < 8:  # impacts hit the upper two rows only
@@ -1032,6 +1428,61 @@ class PlayerState:
             self.last_motors = motors
             await self.vest.send(motors)
             await asyncio.sleep(TICK_MS / 1000)
+
+    async def autoprofile_loop(self):
+        """Auto-apply a preset when an app whose name matches one starts playing.
+
+        Name a preset after the app shown in `vestctl sources` (case-insensitive)
+        and it gets applied — source bound to that app — the moment the game
+        makes sound; the previous audio setup is restored when it exits.
+        """
+        loop = asyncio.get_running_loop()
+        current = None  # {"app", "preset", "saved", "saved_enabled", "saved_preset"}
+        suppressed = set()  # apps the user overrode; skip until their stream is gone
+        while True:
+            await asyncio.sleep(4)
+            a = self.audio
+            if not a.auto_profiles:
+                if current:
+                    current = None
+                    self.auto_profile_app = ""
+                continue
+            apps = await loop.run_in_executor(None, list_audio_apps)
+            suppressed &= set(apps)
+            if current:
+                expect_src = "appname:" + apps.get(current["app"], "")
+                if current["app"] not in apps:
+                    await self.apply_audio_settings(current["saved"])
+                    await a.set_enabled(current["saved_enabled"])
+                    self.active_preset = current["saved_preset"]
+                    log.info("auto profile: %r closed, previous audio setup restored",
+                             current["preset"])
+                    current = None
+                    self.auto_profile_app = ""
+                elif (self.active_preset != current["preset"]
+                      or a.source != expect_src or not a.enabled):
+                    # user changed preset/source/off while active: hands off
+                    suppressed.add(current["app"])
+                    current = None
+                    self.auto_profile_app = ""
+                continue
+            for name in sorted(self.presets):
+                key = name.lower()
+                if key not in apps or key in suppressed:
+                    continue
+                saved = a.settings()
+                saved_enabled = a.enabled
+                saved_preset = self.active_preset
+                cfg = dict(self.presets[name])
+                cfg["source"] = "appname:" + apps[key]
+                await self.apply_audio_settings(cfg)
+                await a.set_enabled(True)
+                self.active_preset = name
+                current = {"app": key, "preset": name, "saved": saved,
+                           "saved_enabled": saved_enabled, "saved_preset": saved_preset}
+                self.auto_profile_app = apps[key]
+                log.info("auto profile: %r applied for %s", name, apps[key])
+                break
 
     async def meter_loop(self):
         while True:
@@ -1099,7 +1550,37 @@ async def ws_handler(ws, state):
                 await ws.send(json.dumps(
                     {"Effect": {"name": name, "frames": state.effects.get(name, [])}}))
                 continue
+            if payload.get("DoctorScan") or payload.get("DoctorFix"):
+                target = str(payload.get("DoctorFix") or "")
+                if target and not re.fullmatch(r"\d+", target):
+                    continue
+                vc = BASE_DIR / "vestctl.py"
+                cmd = ([sys.executable, str(vc)] if vc.exists()
+                       else [shutil.which("vestctl") or "vestctl"])
+                cmd += ["doctor", "--json"] + ([target, "--fix"] if target else ["--all"])
+
+                def run_doctor(c=cmd):
+                    try:
+                        return subprocess.run(c, capture_output=True, text=True, timeout=300)
+                    except Exception as e:
+                        return e
+
+                res = await asyncio.get_running_loop().run_in_executor(None, run_doctor)
+                report = None
+                if isinstance(res, subprocess.CompletedProcess) and res.returncode == 0:
+                    with contextlib.suppress(ValueError):
+                        report = json.loads(res.stdout)
+                if report is not None:
+                    await ws.send(json.dumps({"DoctorReport": report,
+                                              "Fixed": target or None}))
+                else:
+                    err = (res.stderr.strip()[-200:]
+                           if isinstance(res, subprocess.CompletedProcess) else str(res))
+                    await ws.send(json.dumps({"ImportNote": f"🩺 doctor failed: {err}"}))
+                continue
             await state.handle(payload)
+            if "ImportTact" in payload:
+                await ws.send(json.dumps({"ImportNote": state.import_note}))
             await ws.send(state.status_message())
     except websockets.ConnectionClosed:
         pass
@@ -1139,8 +1620,8 @@ def sdk2_ssl_context():
     """SDK2 clients require wss:// but skip certificate validation."""
     import ssl
 
-    cert = BASE_DIR / "sdk2_cert.pem"
-    key = BASE_DIR / "sdk2_key.pem"
+    cert = STATE_DIR / "sdk2_cert.pem"
+    key = STATE_DIR / "sdk2_key.pem"
     if not (cert.exists() and key.exists()):
         log.info("generating self-signed TLS cert for SDK2 port")
         subprocess.run(
@@ -1173,6 +1654,7 @@ def process_request(connection, request):
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    migrate_legacy_state()
     vest = VestLink()
     state = PlayerState(vest)
 
@@ -1183,6 +1665,8 @@ async def main():
 
     if state.audio.start_enabled:
         await state.audio.set_enabled(True)
+    if state.audio.pad_mirror:
+        await state.pad.set_enabled(True)
 
     try:
         await loop.create_datagram_endpoint(
@@ -1196,14 +1680,16 @@ async def main():
         asyncio.create_task(state.mixer()),
         asyncio.create_task(state.status_loop()),
         asyncio.create_task(state.meter_loop()),
+        asyncio.create_task(state.autoprofile_loop()),
     ]
 
+    # big max_size: definition manifests and Register payloads can be MBs
     async with websockets.serve(
         lambda ws: ws_handler(ws, state), "127.0.0.1", 15881,
-        process_request=process_request,
+        process_request=process_request, max_size=16 * 2**20,
     ), websockets.serve(
         lambda ws: sdk2_handler(ws, state), "127.0.0.1", 15882,
-        ssl=sdk2_ssl_context(),
+        ssl=sdk2_ssl_context(), max_size=16 * 2**20,
     ):
         log.info("SDK1 on ws://127.0.0.1:15881/v2/feedbacks — UI at http://127.0.0.1:15881/ui")
         log.info("SDK2 on wss://127.0.0.1:15882/v3/feedback")

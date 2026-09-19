@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=bHaptics Vest Control
+Comment=TactSuit control UI (bhaptics-daemon serves it)
+Exec=xdg-open http://127.0.0.1:15881/ui
+Icon=input-gaming
+Terminal=false
+Categories=Game;Settings;

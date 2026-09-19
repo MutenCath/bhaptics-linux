@@ -27,16 +27,41 @@ project does it.
   bHaptics' public definitions API.
 - **VRChat OSC bridge** — `udp://127.0.0.1:9001`, official
   `bOSC/v2/VestFront|VestBack/0-19` avatar parameter convention.
-- **Audio-to-haptics** — dual-band DSP on any PipeWire source: bass →
-  whole-vest stereo rumble, 1–10 kHz onsets (sword hits, gunshots) → sharp
-  taps on the upper chest. Per-application capture (game audio only — your
-  Discord calls won't buzz), named per-game presets, auto-pauses whenever a
-  real haptics client connects.
+- **Audio-to-haptics** — multi-band DSP on any PipeWire source: bass →
+  stereo rumble, 1–10 kHz onsets (sword hits, gunshots) → sharp taps on the
+  upper chest. Optional **frequency spread** maps sub-bass / bass / low-mids
+  to vest rows (deepest at the belly, mids at the chest) so frequency becomes
+  position. Per-application capture (game audio only — your Discord calls
+  won't buzz), named per-game presets, auto-pauses whenever a real haptics
+  client connects.
+- **Auto per-game presets** — name a preset exactly like the app in the
+  source list (case-insensitive) and it applies itself, bound to that app's
+  audio, the moment the game makes sound; your previous setup is restored
+  when the game exits. Toggle in the UI or `vestctl auto on|off`.
+- **Mod patterns** — import `.tact` files, SDK2 definition manifests (the
+  JSON Unity/Unreal mods ship), or whole mod folders in the UI or with
+  `vestctl import <dir>`; everything is pre-registered at startup under both
+  SDK1 keys and SDK2 event names, so mods that play patterns by name just
+  work. When a game asks for a pattern you don't have, its name shows up in
+  the UI so you know exactly what to import. SDK2 event definitions learned
+  from games are cached across restarts and replayable from the UI.
 - **Web UI** — `http://127.0.0.1:15881/ui`: live motor visualization,
   battery, connected games, audio meter/tuning, an interactive motor-mapping
   wizard, and a multi-frame effect designer.
-- **`vestctl` CLI** — `vestctl status | pulse | stop | audio | preset |
-  effect | sources` for scripts and hotkeys.
+- **Generic haptics for unmodded Unity games** — `vestctl doctor <game>
+  --generic --fix` installs the bundled **VestRumble** BepInEx plugin: it
+  hooks the game's controller-rumble calls (SteamVR, Oculus, Unity XR, new
+  Input System) and mirrors them to the vest as side-aware chest taps.
+  Pairs with audio mode for a surprisingly complete fake integration.
+  Mono Unity only for now; refuses anti-cheat games outright.
+- **Gamepad rumble mirror** — for flat games: the daemon wraps your
+  FF-capable gamepad in a virtual copy; rumble still reaches the pad *and*
+  buzzes the belly/mid rows. No game files involved at all. Toggle in the
+  UI or `vestctl pad on|off` (needs writable `/dev/uinput`; Steam setups
+  usually have it).
+- **`vestctl` CLI** — `vestctl status | pulse | stop | audio | auto | pad |
+  preset | effect | play | import | sources | doctor | proton` for scripts
+  and hotkeys.
 
 ## Install
 
@@ -53,20 +78,56 @@ That creates a venv, installs deps (bleak, websockets, numpy), and sets up a
 to any BLE device named `TactSuit*`/`Tactot*`. Re-run `install.sh` after
 moving the folder. Open the UI, click a grid cell, feel the buzz.
 
+Settings live in `~/.config/bhaptics-linux/` (mapping, presets, effects,
+patterns) and `~/.local/state/bhaptics-linux/` (SDK2 cert + event cache);
+old in-repo state migrates automatically on first start.
+
+On Arch(-based) distros you can install system-wide instead:
+`cd packaging && makepkg -si` (disable the install.sh user unit first if
+you had one).
+
 If effects land on wrong body spots, run the mapping wizard in the UI (the
 TactSuit Pro has 32 motors behind a 40-slot protocol; slots 32–39 are dead).
 
-## SDK2 games under Proton
+## Game mods under Proton
 
-`bhaptics_library.dll` refuses to connect unless it believes the Windows
-Player is installed and running. One-time fix per game (game must be closed):
+One command diagnoses a game's whole bhaptics mod setup — plugin placement
+(BepInEx/plugins), the client library, the Wine prefix trick, local pattern
+files — and fixes what it can:
 
 ```sh
-tools/proton-sdk2-setup.sh <steam-appid>
+vestctl doctor <appid | name | path>          # diagnose + propose
+vestctl doctor <appid | name | path> --fix    # apply the fixes
+vestctl doctor --all --fix                    # one shot for the whole library
 ```
 
-If the mod uses an ASI loader (winmm.dll etc.), prepend
-`WINEDLLOVERRIDES="winmm=n,b"` to the game's Steam launch options.
+The **🩺 Detect games** button in the UI lists every installed game with
+bhaptics support and its patch status — ✓ ready, or what's missing — with a
+per-game **Fix** button, so nothing touches a game folder without you
+clicking it. It distinguishes mods from built-in bhaptics support (many VR
+titles ship the SDK) and native Linux builds (which need nothing). Loader DLL overrides
+(BepInEx→winhttp, ASI→winmm, MelonLoader→version, UE4SS→dwmapi) are baked
+into the prefix registry, so **no `WINEDLLOVERRIDES` launch option is
+needed**; most mods also auto-start our fake Player stub, so usually no
+launch options at all. If a mod doesn't, add
+`tools/proton-wrap.sh %command%`. Background: `bhaptics_library.dll` refuses
+to connect unless it believes the Windows Player is installed and running —
+the doctor fakes the registry entry and drops a stub exe
+(`vestctl proton <appid>` does just that part). Nothing here injects into
+game processes; doctor only places mod files and writes prefix registry
+keys — and it refuses to touch any game containing EasyAntiCheat/BattlEye.
+
+For Unity games with **no** bhaptics support at all:
+
+```sh
+vestctl doctor <game> --generic --fix
+```
+
+installs BepInEx (pinned official release, SHA-256 verified, added files
+only) plus the bundled VestRumble plugin — controller rumble becomes vest
+taps. The plugin source lives in `plugin/VestRumble/` (~200 lines, builds
+with `dotnet build`); tune strength per game in
+`BepInEx/config/org.bhaptics-linux.vestrumble.cfg`.
 
 ## Vibecoded, and proud of it
 

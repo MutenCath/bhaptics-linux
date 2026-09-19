@@ -1,0 +1,27 @@
+# Local PKGBUILD — run `makepkg -si` inside packaging/ to install system-wide
+# (alternative to ./install.sh; disable the user unit from install.sh first:
+#  systemctl --user disable --now bhaptics-daemon)
+pkgname=bhaptics-linux
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio -> BLE, no Windows Player"
+arch=(any)
+license=(GPL-3.0-or-later)
+depends=(python python-websockets python-bleak python-numpy python-evdev bluez libpulse openssl)
+
+package() {
+  local src
+  src="$(realpath "$startdir/..")"
+  install -Dm644 "$src/player_daemon.py" "$pkgdir/usr/lib/bhaptics-linux/player_daemon.py"
+  install -Dm644 "$src/ui.html" "$pkgdir/usr/lib/bhaptics-linux/ui.html"
+  install -Dm755 "$src/tools/proton-sdk2-setup.sh" \
+    "$pkgdir/usr/lib/bhaptics-linux/tools/proton-sdk2-setup.sh"
+  install -Dm755 "$src/tools/proton-wrap.sh" \
+    "$pkgdir/usr/lib/bhaptics-linux/tools/proton-wrap.sh"
+  install -Dm755 "$src/vestctl.py" "$pkgdir/usr/bin/vestctl"
+  install -Dm644 "$src/packaging/bhaptics-daemon.service" \
+    "$pkgdir/usr/lib/systemd/user/bhaptics-daemon.service"
+  install -Dm644 "$src/packaging/bhaptics-vest.desktop" \
+    "$pkgdir/usr/share/applications/bhaptics-vest.desktop"
+  install -Dm644 "$src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -33,5 +33,8 @@ chmod +x vestctl
 mkdir -p "$HOME/.local/bin"
 ln -sf "$PWD/vestctl" "$HOME/.local/bin/vestctl"
 
+mkdir -p "$HOME/.local/share/applications"
+cp packaging/bhaptics-vest.desktop "$HOME/.local/share/applications/"
+
 echo "installed & started from $PWD"
 echo "UI: http://127.0.0.1:15881/ui — CLI: vestctl"

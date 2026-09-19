@@ -8,3 +8,5 @@ audio_presets.json
 effects.json
 *.pem
 *.log
+plugin/VestRumble/bin/
+plugin/VestRumble/obj/

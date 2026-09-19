@@ -3,224 +3,584 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bHaptics vest control</title>
+<title>bHaptics Vest</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦺</text></svg>">
 <style>
   :root {
-    --bg: #0f1117; --card: #181c26; --card2: #1f2432; --edge: #2c3242;
-    --text: #d7dce6; --dim: #7d8698; --accent: #5eb3ff; --good: #62d98a;
-    --warn: #ffb454; --bad: #ff6b6b;
+    --bg0: #0b0e15; --bg1: #10141d;
+    --card: #151a25; --card2: #1a2130; --inset: #10141d;
+    --edge: #232b3c; --edge2: #2f3a52;
+    --text: #e4e9f3; --dim: #8b94a8; --faint: #5d6679;
+    --accent: #4da3ff; --accent2: #86c3ff;
+    --good: #3ddc84; --warn: #ffb454; --bad: #ff5d5d;
+    --radius: 14px;
+    --shadow: 0 10px 30px rgba(0,0,0,.35);
   }
   * { box-sizing: border-box; }
-  body { font-family: "JetBrains Mono", "Fira Mono", monospace; background: var(--bg);
-         color: var(--text); margin: 0; padding: 24px; max-width: 1100px; margin-inline: auto; }
-  h1 { font-size: 1.25em; margin: 0; letter-spacing: 1px; }
-  h1 span { color: var(--accent); }
-  .topbar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
-  #status { padding: 6px 14px; border-radius: 999px; background: var(--card);
-            border: 1px solid var(--edge); font-size: 0.9em; }
-  #status.ok { color: var(--good); border-color: var(--good); }
-  #status.bad { color: var(--bad); border-color: var(--bad); }
-  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 10px;
-          padding: 16px 18px; margin-bottom: 16px; }
-  .card h2 { margin: 0 0 4px; font-size: 0.95em; color: var(--accent);
-             text-transform: uppercase; letter-spacing: 1.5px; }
-  .hint { color: var(--dim); font-size: 0.82em; margin: 2px 0 10px; }
-  .controls { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
-  label { font-size: 0.88em; color: var(--text); display: inline-flex; gap: 8px; align-items: center; }
-  input[type=range] { accent-color: var(--accent); width: 140px; }
-  input[type=number] { width: 52px; background: var(--bg); color: var(--text);
-                       border: 1px solid var(--edge); border-radius: 5px; padding: 4px 6px; }
-  input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
-  button { background: var(--card2); color: var(--text); border: 1px solid var(--edge);
-           border-radius: 6px; padding: 9px 0; width: 54px; cursor: pointer;
-           font-family: inherit; font-size: 0.9em; transition: all .12s; }
-  button:hover { border-color: var(--accent); color: var(--accent); }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    font-size: 15px; line-height: 1.45;
+    background: radial-gradient(1200px 500px at 50% -10%, #141b2c 0%, var(--bg0) 55%) fixed var(--bg0);
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 20px 80px; }
+  section { scroll-margin-top: 118px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---- app bar ---- */
+  .appbar {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    background: rgba(13,17,25,.78); border-bottom: 1px solid var(--edge);
+  }
+  .appbar .inner {
+    max-width: 1080px; margin: 0 auto; padding: 12px 20px 8px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  .brand { font-size: 1.06em; font-weight: 650; letter-spacing: .2px; white-space: nowrap; }
+  .brand b { color: var(--accent); font-weight: 650; }
+  .statuspill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 13px; border-radius: 999px; font-size: .85em;
+    background: var(--card); border: 1px solid var(--edge); color: var(--dim);
+  }
+  .statuspill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .statuspill.ok { color: var(--good); border-color: rgba(61,220,132,.4); }
+  .statuspill.ok .dot { background: var(--good); box-shadow: 0 0 8px var(--good); }
+  .statuspill.bad { color: var(--bad); border-color: rgba(255,93,93,.4); }
+  .statuspill.bad .dot { background: var(--bad); }
+  .batt { display: inline-flex; align-items: center; gap: 7px; font-size: .85em; color: var(--dim); }
+  .batt[hidden] { display: none; }
+  .batt .case {
+    width: 30px; height: 14px; border: 1.5px solid var(--dim); border-radius: 4px;
+    position: relative; padding: 2px;
+  }
+  .batt .case::after {
+    content: ""; position: absolute; right: -5px; top: 3.5px;
+    width: 3px; height: 6px; border-radius: 0 2px 2px 0; background: var(--dim);
+  }
+  .batt i { display: block; height: 100%; border-radius: 2px; background: var(--good); transition: width .4s; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .chip {
+    font-size: .8em; padding: 4px 11px; border-radius: 999px;
+    background: rgba(255,180,84,.12); color: var(--warn); border: 1px solid rgba(255,180,84,.35);
+  }
+  .nav {
+    max-width: 1080px; margin: 0 auto; padding: 0 20px 10px;
+    display: flex; gap: 4px; overflow-x: auto;
+  }
+  .nav a {
+    color: var(--dim); text-decoration: none; font-size: .88em;
+    padding: 6px 14px; border-radius: 999px; transition: all .15s; white-space: nowrap;
+  }
+  .nav a:hover { color: var(--text); background: var(--card2); }
+  .nav a.on { color: var(--accent2); background: rgba(77,163,255,.13); }
+
+  /* ---- cards & layout ---- */
+  .card {
+    background: linear-gradient(180deg, var(--card2), var(--card));
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    padding: 22px 24px; margin: 18px 0; box-shadow: var(--shadow);
+  }
+  .card > h2 {
+    margin: 0 0 2px; font-size: 1.02em; font-weight: 650; letter-spacing: .2px;
+  }
+  .card > h2 .ico { margin-right: 8px; }
+  .hint { color: var(--dim); font-size: .84em; margin: 2px 0 14px; max-width: 72ch; }
+  .row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .group {
+    background: rgba(16,20,29,.55); border: 1px solid var(--edge);
+    border-radius: 10px; padding: 14px 16px; flex: 1 1 240px;
+  }
+  .group h3 {
+    margin: 0 0 10px; font-size: .78em; font-weight: 600; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .groups { display: flex; gap: 14px; flex-wrap: wrap; align-items: stretch; }
+
+  /* ---- controls ---- */
+  label { font-size: .88em; display: inline-flex; gap: 9px; align-items: center; color: var(--text); }
+  .val {
+    min-width: 2.2em; text-align: center; font-size: .85em; color: var(--accent2);
+    background: rgba(77,163,255,.1); border-radius: 6px; padding: 2px 6px;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 140px; height: 5px;
+    border-radius: 3px; background: var(--edge2); outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 17px; height: 17px; border-radius: 50%;
+    background: var(--accent); border: 3px solid #0d1119; box-shadow: 0 0 0 1px var(--edge2);
+    transition: transform .1s;
+  }
+  input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.15); }
+  input[type=range]::-moz-range-thumb {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent); border: 3px solid #0d1119; box-shadow: 0 0 0 1px var(--edge2);
+  }
+  input[type=number], input[type=text], select {
+    background: var(--inset); color: var(--text); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 7px 10px; font: inherit; font-size: .9em;
+  }
+  input[type=number] { width: 74px; }
+  input[type=number]:focus, input[type=text]:focus, select:focus {
+    outline: none; border-color: var(--accent);
+  }
+  select { max-width: 320px; cursor: pointer; }
+  input[type=file] { color: var(--dim); font-size: .84em; max-width: 300px; }
+  input[type=file]::file-selector-button {
+    background: var(--card2); color: var(--text); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 7px 14px; margin-right: 10px; font: inherit;
+    font-size: .95em; cursor: pointer;
+  }
+
+  /* toggle switch */
+  .tog { cursor: pointer; user-select: none; }
+  .switch { position: relative; width: 40px; height: 22px; flex: none; }
+  .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+  .switch i {
+    display: block; height: 100%; border-radius: 999px; background: var(--edge2);
+    transition: background .15s; pointer-events: none;
+  }
+  .switch i::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+    border-radius: 50%; background: #c6cede; transition: transform .15s;
+  }
+  .switch input:checked + i { background: var(--accent); }
+  .switch input:checked + i::after { transform: translateX(18px); background: #fff; }
+
+  /* buttons */
+  button, .btn {
+    background: var(--card2); color: var(--text); border: 1px solid var(--edge2);
+    border-radius: 9px; padding: 8px 16px; cursor: pointer;
+    font: inherit; font-size: .88em; transition: all .13s; white-space: nowrap;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent2); }
   button:active, button.firing { background: var(--accent); color: #06121f; border-color: var(--accent); }
-  button.wide { width: auto; padding: 9px 16px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  button.primary:hover { background: var(--accent2); color: #06121f; }
   button.danger:hover { border-color: var(--bad); color: var(--bad); }
-  .grids { display: flex; gap: 46px; flex-wrap: wrap; }
-  .grids b { color: var(--dim); font-size: 0.8em; letter-spacing: 1px; }
-  table { border-collapse: collapse; margin-top: 6px; }
-  td { padding: 3px; }
-  .raw button { width: 42px; padding: 7px 0; margin: 2px; }
-  #sweepinfo, #mapinfo { color: var(--warn); font-size: 0.85em; }
-  #wizbox { display: none; background: #1c2a3a; border: 1px solid var(--accent); }
-  #wizinfo { color: var(--warn); font-weight: bold; }
-  /* audio meter */
-  .meter { position: relative; height: 26px; background: var(--bg); border: 1px solid var(--edge);
-           border-radius: 6px; overflow: hidden; margin: 8px 0 4px; }
-  #mfill { position: absolute; inset: 0 auto 0 0; width: 0%; background:
-           linear-gradient(90deg, #2a6049, #62d98a); transition: width .08s linear; }
-  #mfill.hot { background: linear-gradient(90deg, #7a4b1d, #ffb454); }
-  #mthresh { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--bad); left: 55%; }
-  .outbars { display: flex; gap: 10px; align-items: center; font-size: 0.8em; color: var(--dim); }
-  .outbar { flex: 1; height: 10px; background: var(--bg); border: 1px solid var(--edge);
-            border-radius: 4px; overflow: hidden; }
-  .outbar div { height: 100%; width: 0%; background: var(--accent); transition: width .08s linear; }
+  button.stopall {
+    background: rgba(255,93,93,.12); border-color: rgba(255,93,93,.4); color: var(--bad);
+    font-weight: 600;
+  }
+  button.stopall:hover { background: var(--bad); color: #1a0505; }
+  button.small { padding: 6px 12px; font-size: .84em; }
+
+  /* ---- vest torsos & motors ---- */
+  .torsos { display: flex; gap: 40px; flex-wrap: wrap; justify-content: center; }
+  .torsowrap { text-align: center; }
+  .torsowrap .cap {
+    color: var(--faint); font-size: .74em; letter-spacing: 2px; font-weight: 600; margin-top: 10px;
+  }
+  .torso {
+    display: grid; grid-template-columns: repeat(4, auto); gap: 9px;
+    padding: 26px 20px 20px;
+    background: linear-gradient(180deg, #1c2434, #151b28);
+    border: 1px solid var(--edge2);
+    border-radius: 58px 58px 26px 26px / 74px 74px 26px 26px;
+    box-shadow: inset 0 2px 14px rgba(0,0,0,.4);
+  }
+  .motor {
+    width: 40px; height: 40px; border-radius: 50%; padding: 0;
+    background: var(--inset); border: 1px solid var(--edge2);
+    color: var(--faint); font-size: .72em;
+    transition: background .1s, box-shadow .1s, border-color .1s;
+  }
+  .motor:hover { border-color: var(--accent); color: var(--accent2); }
+
+  /* raw motor chips */
+  .rawgrid { display: grid; grid-template-columns: repeat(10, 44px); gap: 7px; max-width: 100%; overflow-x: auto; }
+  .rawgrid .motor { width: 42px; height: 42px; border-radius: 12px; }
+
+  /* mapping editor */
+  .mapgrid { display: grid; grid-template-columns: repeat(4, 58px); gap: 7px; }
+  .mapgrid input { width: 58px; text-align: center; padding: 7px 4px; }
+
+  /* ---- xy pads ---- */
+  .pad {
+    position: relative; width: 100%; max-width: 220px; height: 150px;
+    background: var(--inset);
+    background-image:
+      linear-gradient(var(--edge) 1px, transparent 1px),
+      linear-gradient(90deg, var(--edge) 1px, transparent 1px);
+    background-size: 25% 25%;
+    border: 1px solid var(--edge2); border-radius: 10px;
+    cursor: crosshair; touch-action: none; margin: 4px 0 8px;
+  }
+  .pad.dis { opacity: .35; pointer-events: none; }
+  .paddot {
+    position: absolute; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); border: 2px solid rgba(255,255,255,.25);
+    transform: translate(-50%, -50%); pointer-events: none;
+    box-shadow: 0 0 8px rgba(77,163,255,.5); transition: box-shadow .1s;
+  }
+  #dotimp { background: var(--warn); box-shadow: 0 0 8px rgba(255,180,84,.5); }
+  .pad .ax {
+    position: absolute; font-size: .7em; color: var(--faint);
+    pointer-events: none; user-select: none;
+  }
+  .pad .ay { top: 6px; left: 9px; }
+  .pad .axx { bottom: 5px; right: 9px; }
+  .padcap { font-size: .8em; color: var(--dim); }
+  .padcap b { color: var(--accent2); font-weight: 600; }
+  .groupsub { color: var(--dim); font-size: .8em; margin: -4px 0 10px; }
+
+  /* ---- audio meter ---- */
+  .meter {
+    position: relative; height: 30px; border-radius: 8px; overflow: hidden;
+    background: var(--inset); border: 1px solid var(--edge); margin: 4px 0 10px;
+  }
+  #mfill {
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    background: linear-gradient(90deg, rgba(61,220,132,.25), var(--good));
+    transition: width .08s linear;
+  }
+  #mfill.hot { background: linear-gradient(90deg, rgba(255,180,84,.3), var(--warn)); }
+  #mthresh {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: var(--bad); left: 55%;
+    box-shadow: 0 0 6px rgba(255,93,93,.8);
+  }
+  .lane { display: flex; gap: 10px; align-items: center; margin-top: 7px; }
+  .lanelabel {
+    width: 66px; text-align: right; flex: none; font-size: .72em; color: var(--accent);
+    letter-spacing: 1.2px; text-transform: uppercase; font-weight: 600;
+  }
+  .lanelabel.imp { color: var(--warn); }
+  .lr { font-size: .72em; color: var(--faint); flex: none; }
+  .outbar {
+    flex: 1; height: 8px; background: var(--inset); border: 1px solid var(--edge);
+    border-radius: 999px; overflow: hidden;
+  }
+  .outbar div { height: 100%; width: 0%; background: var(--accent); transition: width .08s linear; border-radius: 999px; }
+  .outbar div.imp { background: var(--warn); }
+  .statustext { color: var(--warn); font-size: .84em; }
+
+  /* wizard */
+  #wizbox {
+    display: none; border-color: var(--accent);
+    background: linear-gradient(180deg, rgba(77,163,255,.1), var(--card));
+  }
+  #wizbox.show { display: block; }
+  #wizinfo { color: var(--warn); font-weight: 600; }
+
+  /* collapsible advanced tools */
+  details.adv { margin: 14px 0; }
+  details.adv > summary {
+    list-style: none; cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--card); border: 1px solid var(--edge); border-radius: var(--radius);
+    padding: 15px 22px; font-weight: 600; font-size: .95em; transition: border-color .15s;
+  }
+  details.adv > summary::-webkit-details-marker { display: none; }
+  details.adv > summary::before { content: "▸"; color: var(--faint); transition: transform .15s; }
+  details.adv[open] > summary::before { transform: rotate(90deg); }
+  details.adv > summary:hover { border-color: var(--accent); }
+  details.adv > summary .sub { color: var(--faint); font-weight: 400; font-size: .86em; }
+  details.adv > .card { margin-top: 6px; }
+
+  /* toasts */
+  #toasts {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; gap: 8px; z-index: 100; align-items: center;
+  }
+  .toast {
+    background: var(--card2); border: 1px solid var(--accent); color: var(--text);
+    border-radius: 10px; padding: 10px 20px; font-size: .88em; box-shadow: var(--shadow);
+    opacity: 0; transform: translateY(8px); transition: all .25s;
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.err { border-color: var(--bad); }
+
+  /* doctor game rows */
+  .gamerow {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    background: var(--inset); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 10px 14px; margin-top: 8px;
+  }
+  .gamerow .gname { font-weight: 600; }
+  .kchip {
+    font-size: .72em; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--edge2); color: var(--dim); white-space: nowrap;
+  }
+  .kchip.mod { color: var(--accent2); border-color: rgba(77,163,255,.4); }
+  .gstat { font-size: .8em; color: var(--dim); flex: 1; min-width: 220px; }
+  .gstat.ok { color: var(--good); }
+  .gstat.warn { color: var(--warn); }
+
+  .sectionlabel {
+    margin: 34px 4px 0; font-size: .78em; font-weight: 600;
+    letter-spacing: 2px; text-transform: uppercase; color: var(--faint);
+  }
 </style>
 </head>
 <body>
-<div class="topbar">
-  <h1>bHaptics <span>vest control</span></h1>
-  <div id="status">connecting…</div>
-  <div id="game" style="color: var(--warn); font-size: 0.88em;"></div>
-  <button class="wide danger" onclick="turnOffAll()">STOP ALL</button>
-</div>
 
-<div class="card">
-  <h2>Feedback controls</h2>
-  <div class="controls">
-    <label>intensity <input type="range" id="intensity" min="1" max="100" value="60">
-      <span id="ival">60</span></label>
-    <label>duration ms <input type="number" id="duration" value="300" min="40" max="5000" step="20"></label>
+<header class="appbar">
+  <div class="inner">
+    <div class="brand">🦺 bHaptics <b>Vest</b></div>
+    <div class="statuspill" id="status"><span class="dot"></span><span id="statustext">connecting…</span></div>
+    <div class="batt" id="batt" hidden><span class="case"><i id="battfill"></i></span><span class="num" id="battpct"></span></div>
+    <div class="chips" id="game"></div>
+    <button class="stopall" onclick="turnOffAll()">■&nbsp; Stop all</button>
   </div>
-</div>
+  <nav class="nav">
+    <a href="#sec-vest">Vest</a>
+    <a href="#sec-audio">Audio</a>
+    <a href="#sec-effects">Effects</a>
+    <a href="#sec-mods">Mods</a>
+    <a href="#sec-advanced">Advanced</a>
+  </nav>
+</header>
 
-<div class="card">
-  <h2>Audio mode</h2>
-  <div class="hint">system audio → bass → vest. The bar is loudness relative to recent audio;
-    it buzzes only past the red line (higher sensitivity moves the line left).</div>
-  <div class="controls">
-    <label><input type="checkbox" id="audio" onchange="audioSend()"> enabled</label>
-    <span id="asup" style="color: var(--warn); font-size: 0.85em;"></span>
-    <label><input type="checkbox" id="stereo" checked onchange="audioSend()"> stereo (L/R → left/right motors)</label>
-    <label>sensitivity <input type="range" id="again" value="4" min="1" max="10" step="0.5" oninput="audioSlider()">
-      <span id="againv">4</span></label>
-    <label>strength <input type="range" id="amax" value="8" min="1" max="15" step="1" oninput="audioSlider()">
-      <span id="amaxv">8</span></label>
+<main>
+
+<section id="sec-vest">
+  <div class="card" id="wizbox">
+    <h2><span class="ico">🧭</span>Mapping wizard</h2>
+    <div style="margin:8px 0"><span id="wizinfo"></span></div>
+    <div class="hint">The vest buzzes ONE raw motor. Click the cell (front or back) where you
+      felt it. Felt nothing, or same spot as previous? Hit Skip.</div>
+    <div class="row">
+      <button onclick="wizardReplay()">Replay buzz</button>
+      <button onclick="wizardSkip()">Skip</button>
+      <button onclick="wizardBack()">Back one</button>
+      <button class="danger" onclick="cancelWizard()">Cancel</button>
+    </div>
   </div>
-  <div class="controls" style="margin-top:8px">
-    <label><input type="checkbox" id="impact" checked onchange="audioSend()"> impacts
-      <span id="impdot" style="display:inline-block;width:10px;height:10px;border-radius:50%;
-            background:#333;transition:background .1s"></span></label>
-    <label>impact sensitivity <input type="range" id="igain" value="5" min="1" max="10" step="0.5" oninput="audioSlider()">
-      <span id="igainv">5</span></label>
-    <label>impact strength <input type="range" id="imax" value="6" min="1" max="15" step="1" oninput="audioSlider()">
-      <span id="imaxv">6</span></label>
-    <span class="hint">sharp taps on the upper chest for sword hits / gunshots (1–10 kHz onsets)</span>
+
+  <div class="card">
+    <h2><span class="ico">🎯</span>Vest</h2>
+    <div class="hint">Live view — cells light up when their motor vibrates (game, mod or audio).
+      Click a cell to feel it. Grid-left = your left, top row = shoulders.</div>
+    <div class="torsos">
+      <div class="torsowrap"><div class="torso" id="gfront"></div><div class="cap">FRONT</div></div>
+      <div class="torsowrap"><div class="torso" id="gback"></div><div class="cap">BACK</div></div>
+    </div>
+    <div class="row" style="justify-content:center; margin-top:18px">
+      <label>intensity <input type="range" id="intensity" min="1" max="100" value="60">
+        <span class="val num" id="ival">60</span></label>
+      <label>duration <input type="number" id="duration" value="300" min="40" max="5000" step="20"> ms</label>
+      <button onclick="startWizard()">Start mapping wizard</button>
+    </div>
   </div>
-  <div class="controls" style="margin-top:8px">
-    <label>source
-      <select id="asrc" onchange="audioSend()" style="background: var(--bg); color: var(--text);
-              border: 1px solid var(--edge); border-radius: 5px; padding: 5px; max-width: 340px;">
-        <option value="default">System output (default)</option>
+</section>
+
+<section id="sec-audio">
+  <div class="card">
+    <h2><span class="ico">🔊</span>Audio haptics</h2>
+    <div class="hint">Game audio → vest, split into two channels you tune on the pads below:
+      drag the dot <b>up for a stronger buzz</b>, <b>right to trigger on quieter sounds</b>.
+      The dot glows when its channel is firing. The bar shows loudness relative to recent
+      audio — rumble fires past the red line (dragging right moves that line left).</div>
+
+    <div class="row">
+      <label class="tog"><span class="switch"><input type="checkbox" id="audio" onchange="audioSend()"><i></i></span>
+        Audio mode</label>
+      <span class="statustext" id="asup"></span>
+    </div>
+
+    <div class="meter"><div id="mfill"></div><div id="mthresh"></div></div>
+    <div class="lane"><span class="lanelabel">rumble</span>
+      <span class="lr">L</span><div class="outbar"><div id="outl"></div></div>
+      <span class="lr">R</span><div class="outbar"><div id="outr"></div></div>
+    </div>
+    <div class="lane"><span class="lanelabel imp">impacts</span>
+      <span class="lr">L</span><div class="outbar"><div id="impl" class="imp"></div></div>
+      <span class="lr">R</span><div class="outbar"><div id="impr" class="imp"></div></div>
+    </div>
+
+    <div class="groups" style="margin-top:16px">
+      <div class="group">
+        <h3>Rumble · bass</h3>
+        <div class="groupsub">explosions, engines, music beats → the whole vest hums along</div>
+        <input type="hidden" id="again" value="4">
+        <input type="hidden" id="amax" value="8">
+        <div class="pad" id="padrum">
+          <span class="ax ay">↑ stronger</span>
+          <span class="ax axx">more sensitive →</span>
+          <div class="paddot" id="dotrum"></div>
+        </div>
+        <div class="padcap">sensitivity <b class="num" id="againv">4</b>/10 ·
+          strength <b class="num" id="amaxv">8</b>/15</div>
+        <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="stereo" checked onchange="audioSend()"><i></i></span>
+          stereo — L/R audio → left/right motors</label>
+        <label class="tog" style="margin-top:8px"><span class="switch"><input type="checkbox" id="spread" onchange="audioSend()"><i></i></span>
+          frequency spread — deepest bass at the belly, mids at the chest</label>
+      </div>
+
+      <div class="group">
+        <h3>Impacts · sharp highs</h3>
+        <div class="groupsub">gunshots, sword hits, punches → a quick tap on the upper chest</div>
+        <input type="hidden" id="igain" value="5">
+        <input type="hidden" id="imax" value="6">
+        <div class="pad" id="padimp">
+          <span class="ax ay">↑ stronger</span>
+          <span class="ax axx">more sensitive →</span>
+          <div class="paddot" id="dotimp"></div>
+        </div>
+        <div class="padcap">sensitivity <b class="num" id="igainv">5</b>/10 ·
+          strength <b class="num" id="imaxv">6</b>/15</div>
+        <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="impact" checked onchange="audioSend()"><i></i></span>
+          detect impacts (1–10 kHz onsets)</label>
+      </div>
+
+      <div class="group">
+        <h3>Source</h3>
+        <div class="row" style="margin:0">
+          <select id="asrc" onchange="audioSend()">
+            <option value="default">System output (default)</option>
+          </select>
+          <button class="small" onclick="refreshSources()">↻ refresh</button>
+        </div>
+        <div class="hint" style="margin:10px 0 0">pick the game's own stream so voice chat
+          and music don't buzz you</div>
+      </div>
+
+      <div class="group">
+        <h3>Controller rumble</h3>
+        <label class="tog"><span class="switch"><input type="checkbox" id="padmir"
+          onchange="send({PadMirror: this.checked})"><i></i></span>
+          mirror gamepad rumble to the vest</label>
+        <div class="hint" style="margin:8px 0 0">for flat games with a gamepad: the pad is
+          wrapped in a virtual copy, rumble buzzes belly/mid rows. Steam Input games may need
+          controller support set to none for that game.</div>
+        <div class="statustext" style="color:var(--good)" id="padinfo"></div>
+      </div>
+
+      <div class="group">
+        <h3>Presets</h3>
+        <div class="row" style="margin:0 0 10px">
+          <select id="preset" onchange="applyPreset()" style="max-width:200px">
+            <option value="">— none —</option>
+          </select>
+          <button class="small" onclick="savePreset()">Save as…</button>
+          <button class="small danger" onclick="deletePreset()">Delete</button>
+        </div>
+        <label class="tog"><span class="switch"><input type="checkbox" id="autoprof" checked onchange="audioSend()"><i></i></span>
+          auto per-game preset</label>
+        <div class="hint" style="margin:8px 0 0">name a preset exactly like the app in the source
+          list — it applies itself when that game plays sound, and reverts when it exits</div>
+        <div class="statustext" style="color:var(--good)" id="autoinfo"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sec-effects">
+  <div class="card">
+    <h2><span class="ico">✏️</span>Effect designer</h2>
+    <div class="hint">Paint cells at the current intensity (click again to erase), build frames,
+      save under a name — play from here, <code>vestctl effect &lt;name&gt;</code>, or scripts.</div>
+    <div class="torsos">
+      <div class="torsowrap"><div class="torso" id="pfront"></div><div class="cap">FRONT</div></div>
+      <div class="torsowrap"><div class="torso" id="pback"></div><div class="cap">BACK</div></div>
+    </div>
+    <div class="row" style="justify-content:center; margin-top:16px">
+      <button class="small" onclick="fxNav(-1)">◀</button>
+      <span class="num" id="fxlabel" style="font-size:.9em">frame 1/1</span>
+      <button class="small" onclick="fxNav(1)">▶</button>
+      <label><input type="number" id="fxms" value="150" min="20" max="10000" step="10"
+        onchange="fx.frames[fx.cur].ms = parseInt(this.value)||150"> ms</label>
+      <button class="small" onclick="fxAdd()">+ frame</button>
+      <button class="small danger" onclick="fxDel()">− frame</button>
+      <button class="small" onclick="fxClear()">clear</button>
+      <button class="primary" onclick="fxPlayAll()">▶ Play</button>
+    </div>
+    <div class="row" style="justify-content:center">
+      <label>name <input type="text" id="fxname" placeholder="heartbeat" style="width:150px"></label>
+      <button onclick="fxSave()">Save</button>
+      <select id="fxsel">
+        <option value="">— saved effects —</option>
       </select>
-    </label>
-    <button class="wide" onclick="refreshSources()">↻ refresh</button>
+      <button class="small" onclick="fxPlaySel()">Play</button>
+      <button class="small" onclick="fxLoad()">Load</button>
+      <button class="small danger" onclick="fxDelete()">Delete</button>
+    </div>
   </div>
-  <div class="controls" style="margin-top:8px">
-    <label>preset
-      <select id="preset" onchange="applyPreset()" style="background: var(--bg); color: var(--text);
-              border: 1px solid var(--edge); border-radius: 5px; padding: 5px; max-width: 220px;">
-        <option value="">— none —</option>
-      </select>
-    </label>
-    <button class="wide" onclick="savePreset()">Save as…</button>
-    <button class="wide danger" onclick="deletePreset()">Delete</button>
-    <span class="hint">a preset stores sensitivity, strength, stereo and source — one per game</span>
-  </div>
-  <div class="meter"><div id="mfill"></div><div id="mthresh"></div></div>
-  <div class="outbars">
-    <span>out&nbsp;L</span><div class="outbar"><div id="outl"></div></div>
-    <span>R</span><div class="outbar"><div id="outr"></div></div>
-  </div>
-</div>
+</section>
 
-<div class="card" id="wizbox">
-  <h2>Mapping wizard</h2>
-  <div><span id="wizinfo"></span></div>
-  <div class="hint">The vest buzzes ONE raw motor. Click the grid cell (front or back) where you
-    felt it. Felt nothing, or same spot as previous? Hit Skip.</div>
-  <div class="controls">
-    <button class="wide" onclick="wizardReplay()">Replay buzz</button>
-    <button class="wide" onclick="wizardSkip()">Skip</button>
-    <button class="wide" onclick="wizardBack()">Back one</button>
-    <button class="wide danger" onclick="cancelWizard()">Cancel</button>
+<section id="sec-mods">
+  <div class="card">
+    <h2><span class="ico">🧩</span>Mod patterns &amp; SDK2 events</h2>
+    <div class="hint">Import .tact files or whole mod folders — single patterns and SDK2
+      definition manifests (the JSON Unity/Unreal mods ship) both work, and everything is
+      pre-registered at every start under both SDK1 keys and SDK2 event names. Patterns games
+      asked for but we don't have show up below in orange.</div>
+    <div class="row">
+      <input type="file" id="tactfile" accept=".tact,.json" multiple>
+      <button onclick="importTact()">Import files</button>
+      <input type="file" id="tactdir" webkitdirectory style="display:none"
+             onchange="importTact(this.files)">
+      <button onclick="document.getElementById('tactdir').click()">Import mod folder…</button>
+      <button onclick="doctorScan()">🩺 Detect games</button>
+    </div>
+    <div class="hint" id="misskeys" style="color:var(--warn); margin:10px 0 0"></div>
+    <div id="games"></div>
+    <div class="row">
+      <label>pattern
+        <select id="patsel" style="max-width:240px">
+          <option value="">— none imported —</option>
+        </select>
+      </label>
+      <button class="small" onclick="patPlay()">Play</button>
+      <button class="small danger" onclick="patDelete()">Delete</button>
+      <label style="margin-left:12px">sdk2 event
+        <select id="evsel" style="max-width:240px">
+          <option value="">— none learned —</option>
+        </select>
+      </label>
+      <button class="small" onclick="evPlay()">Play</button>
+    </div>
   </div>
-</div>
+</section>
 
-<div class="card">
-  <h2>Grid test</h2>
-  <div class="hint">live view: cells light up when their motor vibrates (game or audio).
-    Click a cell to buzz it. Both grids: grid-left = YOUR left, top row = shoulders.</div>
-  <div class="grids">
-    <div><b>FRONT</b><table id="gfront"></table></div>
-    <div><b>BACK</b><table id="gback"></table></div>
-  </div>
-  <div class="controls" style="margin-top:10px">
-    <button class="wide" onclick="startWizard()">Start mapping wizard</button>
-  </div>
-</div>
+<section id="sec-advanced">
+  <div class="sectionlabel">Advanced</div>
 
-<div class="card">
-  <h2>Raw motors</h2>
-  <div class="hint">BLE slots 0–39, bypasses mapping. TactSuit Pro: 32–39 are dead slots.</div>
-  <div class="raw" id="rawbtns"></div>
-  <div class="controls" style="margin-top:8px">
-    <button class="wide" onclick="sweep()">SWEEP 0→39</button>
-    <span id="sweepinfo"></span>
-  </div>
-</div>
+  <details class="adv">
+    <summary>Raw motors <span class="sub">— BLE slots 0–39, bypasses mapping</span></summary>
+    <div class="card">
+      <div class="hint">TactSuit Pro: slots 32–39 are dead. Sweep to find which slots your
+        vest actually has.</div>
+      <div class="rawgrid" id="rawbtns"></div>
+      <div class="row">
+        <button onclick="sweep()">Sweep 0 → 39</button>
+        <span class="hint" id="sweepinfo" style="margin:0"></span>
+      </div>
+    </div>
+  </details>
 
-<div class="card">
-  <h2>Mapping editor</h2>
-  <div class="hint">raw motor per grid cell; autosaves 5s after edits (or Save now). Feels
-    mirrored in games? Flip L↔R.</div>
-  <div class="grids">
-    <div><b>FRONT</b><table id="mfront"></table></div>
-    <div><b>BACK</b><table id="mback"></table></div>
-  </div>
-  <div class="controls" style="margin-top:10px">
-    <button class="wide" onclick="saveMapping()">Save mapping</button>
-    <button class="wide" onclick="flipMap('mfront')">Flip FRONT L↔R</button>
-    <button class="wide" onclick="flipMap('mback')">Flip BACK L↔R</button>
-    <button class="wide" onclick="mappingDirty=false; fillMapping(lastStatus)">Reload</button>
-    <span id="mapinfo"></span>
-  </div>
-</div>
+  <details class="adv">
+    <summary>Mapping editor <span class="sub">— raw motor per grid cell</span></summary>
+    <div class="card">
+      <div class="hint">Autosaves 5 s after edits (or Save now). Feels mirrored in games?
+        Flip L↔R. The wizard up in the Vest section fills this in by feel.</div>
+      <div class="torsos">
+        <div class="torsowrap"><div class="mapgrid" id="mfront"></div><div class="cap">FRONT</div></div>
+        <div class="torsowrap"><div class="mapgrid" id="mback"></div><div class="cap">BACK</div></div>
+      </div>
+      <div class="row">
+        <button onclick="saveMapping()">Save mapping</button>
+        <button onclick="flipMap('mfront')">Flip FRONT L↔R</button>
+        <button onclick="flipMap('mback')">Flip BACK L↔R</button>
+        <button onclick="mappingDirty=false; fillMapping(lastStatus)">Reload</button>
+        <span class="hint" id="mapinfo" style="margin:0"></span>
+      </div>
+    </div>
+  </details>
+</section>
 
-<div class="card">
-  <h2>Effect designer</h2>
-  <div class="hint">paint cells at the current intensity (click again to erase), build frames,
-    save under a name — play from here, <code>vestctl effect &lt;name&gt;</code>, or scripts.</div>
-  <div class="grids">
-    <div><b>FRONT</b><table id="pfront"></table></div>
-    <div><b>BACK</b><table id="pback"></table></div>
-  </div>
-  <div class="controls" style="margin-top:10px">
-    <button class="wide" onclick="fxNav(-1)">◀</button>
-    <span id="fxlabel">frame 1/1</span>
-    <button class="wide" onclick="fxNav(1)">▶</button>
-    <label>ms <input type="number" id="fxms" value="150" min="20" max="10000" step="10"
-      onchange="fx.frames[fx.cur].ms = parseInt(this.value)||150"></label>
-    <button class="wide" onclick="fxAdd()">+ frame</button>
-    <button class="wide danger" onclick="fxDel()">− frame</button>
-    <button class="wide" onclick="fxClear()">clear frame</button>
-    <button class="wide" onclick="fxPlayAll()">▶ play</button>
-  </div>
-  <div class="controls" style="margin-top:8px">
-    <label>name <input type="text" id="fxname" placeholder="heartbeat"
-      style="background: var(--bg); color: var(--text); border: 1px solid var(--edge);
-             border-radius: 5px; padding: 5px; width: 150px;"></label>
-    <button class="wide" onclick="fxSave()">Save</button>
-    <select id="fxsel" style="background: var(--bg); color: var(--text);
-            border: 1px solid var(--edge); border-radius: 5px; padding: 5px;">
-      <option value="">— saved effects —</option>
-    </select>
-    <button class="wide" onclick="fxPlaySel()">Play</button>
-    <button class="wide" onclick="fxLoad()">Load</button>
-    <button class="wide danger" onclick="fxDelete()">Delete</button>
-    <span id="fxinfo" class="hint"></span>
-  </div>
-</div>
+</main>
+<div id="toasts"></div>
 
 <script>
 let ws, lastStatus = null, mappingDirty = false, wizard = null, audioInit = false;
 
 function connect() {
   ws = new WebSocket("ws://127.0.0.1:15881/v2/feedbacks?app_id=ui&app_name=VestUI");
-  ws.onopen = () => { setStatus("ws connected, waiting for vest…", true);
+  ws.onopen = () => { setStatus("waiting for vest…", null);
                       ws.send(JSON.stringify({Subscribe: "audiometer"}));
                       refreshSources(); };
   ws.onclose = () => { setStatus("daemon unreachable — retrying…", false); setTimeout(connect, 2000); };
@@ -233,27 +593,55 @@ function connect() {
     }
     if (msg.AudioSources) return fillSources(msg.AudioSources);
     if (msg.Effect) return loadEffect(msg.Effect);
+    if (msg.ImportNote) return importNote(msg.ImportNote);
+    if (msg.DoctorReport) {
+      for (const g of msg.DoctorReport) doctorGames[g.appid] = g;
+      renderGames();
+      if (msg.Fixed) {
+        const g = msg.DoctorReport[0];
+        toast(g && g.ok ? `✓ ${g.name} is ready` : "some issues remain — see the list");
+      } else {
+        toast(`bhaptics support found in ${msg.DoctorReport.length} game(s)`);
+      }
+      return;
+    }
     lastStatus = msg;
     const c = msg.ConnectedDeviceCount > 0;
-    const bat = (c && msg.Battery != null) ? ` · 🔋${msg.Battery}%` : "";
-    setStatus(c ? "vest CONNECTED" + bat : "vest not found (is it on?)", c);
-    document.getElementById("game").textContent =
-      msg.GameClients && msg.GameClients.length ? "🎮 " + msg.GameClients.join(", ") : "";
+    setStatus(c ? "vest connected" : "searching for vest…", c);
+    const batt = document.getElementById("batt");
+    if (c && msg.Battery != null) {
+      batt.hidden = false;
+      document.getElementById("battpct").textContent = msg.Battery + "%";
+      const fill = document.getElementById("battfill");
+      fill.style.width = msg.Battery + "%";
+      fill.style.background = msg.Battery <= 20 ? "var(--bad)" : msg.Battery <= 40 ? "var(--warn)" : "var(--good)";
+    } else batt.hidden = true;
+    const game = document.getElementById("game");
+    game.innerHTML = "";
+    for (const g of msg.GameClients || []) {
+      const s = document.createElement("span");
+      s.className = "chip"; s.textContent = "🎮 " + g;
+      game.appendChild(s);
+    }
     document.getElementById("audio").checked = !!msg.AudioMode;
+    if ("AudioAuto" in msg) document.getElementById("autoprof").checked = !!msg.AudioAuto;
+    if ("PadMirror" in msg) document.getElementById("padmir").checked = !!msg.PadMirror;
+    document.getElementById("padinfo").textContent =
+      (msg.PadDevices || []).length ? "🎮 " + msg.PadDevices.join(", ") : "";
+    document.getElementById("autoinfo").textContent =
+      msg.AutoProfileApp ? "▶ active: " + msg.AutoProfileApp : "";
     if ((!audioInit || refreshAudioUI) && "AudioGain" in msg) {
       audioInit = true; refreshAudioUI = false;
       document.getElementById("stereo").checked = !!msg.AudioStereo;
+      document.getElementById("spread").checked = !!msg.AudioSpread;
       document.getElementById("again").value = msg.AudioGain;
       document.getElementById("amax").value = msg.AudioMax;
-      document.getElementById("againv").textContent = msg.AudioGain;
-      document.getElementById("amaxv").textContent = msg.AudioMax;
       if ("AudioImpact" in msg) {
         document.getElementById("impact").checked = !!msg.AudioImpact;
         document.getElementById("igain").value = msg.AudioImpGain;
         document.getElementById("imax").value = msg.AudioImpMax;
-        document.getElementById("igainv").textContent = msg.AudioImpGain;
-        document.getElementById("imaxv").textContent = msg.AudioImpMax;
       }
+      padsRender();
       const src = document.getElementById("asrc");
       if (![...src.options].some(o => o.value === msg.AudioSource)) {
         const o = document.createElement("option");
@@ -264,19 +652,36 @@ function connect() {
     }
     if ("Presets" in msg) fillPresets(msg.Presets, msg.ActivePreset);
     if ("Effects" in msg) fillEffects(msg.Effects);
+    if ("Patterns" in msg) fillSelect("patsel", msg.Patterns, "— none imported —");
+    if ("Sdk2Events" in msg) fillSelect("evsel", msg.Sdk2Events, "— none learned —");
+    if ("MissingKeys" in msg)
+      document.getElementById("misskeys").textContent = msg.MissingKeys.length
+        ? "🎮 games asked for patterns we don't have: " + msg.MissingKeys.join(", ")
+          + " — import mod files containing these names"
+        : "";
     if (!mappingDirty) fillMapping(msg);
   };
 }
 function setStatus(txt, ok) {
-  const el = document.getElementById("status");
-  el.textContent = txt; el.className = ok ? "ok" : "bad";
+  document.getElementById("statustext").textContent = txt;
+  document.getElementById("status").className =
+    "statuspill" + (ok === true ? " ok" : ok === false ? " bad" : "");
 }
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function toast(msg, err) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : "");
+  t.textContent = msg;
+  document.getElementById("toasts").appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, 2600);
+}
 const intensity = () => parseInt(document.getElementById("intensity").value);
 const duration = () => parseInt(document.getElementById("duration").value) || 300;
 document.getElementById("intensity").oninput =
   (e) => document.getElementById("ival").textContent = e.target.value;
 
+let impHoldL = 0, impHoldR = 0;
 function updateMeter(m) {
   const fill = document.getElementById("mfill");
   fill.style.width = (m.on ? m.rel * 100 : 0) + "%";
@@ -284,12 +689,20 @@ function updateMeter(m) {
   document.getElementById("mthresh").style.left = (m.thresh * 100) + "%";
   document.getElementById("outl").style.width = (m.outL * 100) + "%";
   document.getElementById("outr").style.width = (m.outR * 100) + "%";
+  // impacts are single-frame taps: hold the peak briefly so the eye catches them
+  impHoldL = Math.max(m.impL || 0, impHoldL * 0.86);
+  impHoldR = Math.max(m.impR || 0, impHoldR * 0.86);
+  document.getElementById("impl").style.width = (impHoldL * 100) + "%";
+  document.getElementById("impr").style.width = (impHoldR * 100) + "%";
   document.getElementById("asup").textContent =
     m.suppressed ? "⏸ paused — game connected"
     : m.waiting ? "⏳ waiting for the selected app to play audio…" : "";
+  const rl = Math.max(m.outL || 0, m.outR || 0);
+  document.getElementById("dotrum").style.boxShadow =
+    rl > 0.02 ? `0 0 ${8 + rl * 30}px rgba(77,163,255,${0.4 + 0.6 * rl})` : "";
   const imp = Math.max(m.impL || 0, m.impR || 0);
-  document.getElementById("impdot").style.background =
-    imp > 0.02 ? `rgba(255,180,84,${0.4 + 0.6 * imp})` : "#333";
+  document.getElementById("dotimp").style.boxShadow =
+    imp > 0.02 ? `0 0 ${8 + imp * 30}px rgba(255,180,84,${0.4 + 0.6 * imp})` : "";
 }
 
 function fireDot(position, index) {
@@ -305,12 +718,15 @@ function turnOffAll() { send({Submit: [{Type: "turnOffAll"}]}); }
 function audioSend() {
   send({AudioMode: {enabled: document.getElementById("audio").checked,
                     stereo: document.getElementById("stereo").checked,
+                    spread: document.getElementById("spread").checked,
                     gain: parseFloat(document.getElementById("again").value) || 4,
                     max: parseInt(document.getElementById("amax").value) || 8,
                     impact: document.getElementById("impact").checked,
                     impGain: parseFloat(document.getElementById("igain").value) || 5,
                     impMax: parseInt(document.getElementById("imax").value) || 6,
+                    auto: document.getElementById("autoprof").checked,
                     source: document.getElementById("asrc").value || "default"}});
+  padsRender();
 }
 function refreshSources() { send({ListAudioSources: true}); }
 function fillSources(list) {
@@ -336,12 +752,13 @@ function paint(id, v) {
   const b = document.getElementById(id);
   if (!b) return;
   if (v > 0) {
-    const a = 0.25 + 0.75 * (v / 15);
-    b.style.background = `rgba(94,179,255,${a})`;
+    const a = 0.3 + 0.7 * (v / 15);
+    b.style.background = `rgba(77,163,255,${a})`;
+    b.style.boxShadow = `0 0 ${4 + v}px rgba(77,163,255,${a})`;
     b.style.color = "#06121f";
     b.style.borderColor = "var(--accent)";
   } else {
-    b.style.background = ""; b.style.color = ""; b.style.borderColor = "";
+    b.style.background = ""; b.style.boxShadow = ""; b.style.color = ""; b.style.borderColor = "";
   }
 }
 let refreshAudioUI = false;
@@ -351,12 +768,12 @@ function applyPreset() {
 }
 function savePreset() {
   const cur = document.getElementById("preset").value;
-  const n = prompt("Preset name (e.g. game title):", cur || "");
-  if (n && n.trim()) send({SavePreset: n.trim()});
+  const n = prompt("Preset name (use the game's name from the source list for auto-apply):", cur || "");
+  if (n && n.trim()) { send({SavePreset: n.trim()}); toast(`preset "${n.trim()}" saved`); }
 }
 function deletePreset() {
   const n = document.getElementById("preset").value;
-  if (n && confirm(`Delete preset "${n}"?`)) send({DeletePreset: n});
+  if (n && confirm(`Delete preset "${n}"?`)) { send({DeletePreset: n}); toast(`preset "${n}" deleted`); }
 }
 function fillPresets(names, active) {
   const sel = document.getElementById("preset");
@@ -369,18 +786,45 @@ function fillPresets(names, active) {
   sel.value = active || "";
 }
 let audioTimer = null;
-function audioSlider() {
-  for (const [s, v] of [["again","againv"],["amax","amaxv"],["igain","igainv"],["imax","imaxv"]])
-    document.getElementById(v).textContent = document.getElementById(s).value;
-  clearTimeout(audioTimer);
-  audioTimer = setTimeout(audioSend, 250);
+
+/* ---- xy pads: x = sensitivity (gain 1-10), y = strength (max 1-15) ---- */
+const PADS = [["padrum", "dotrum", "again", "amax", "againv", "amaxv"],
+              ["padimp", "dotimp", "igain", "imax", "igainv", "imaxv"]];
+function padsRender() {
+  for (const [, dotId, gId, mId, gvId, mvId] of PADS) {
+    const gain = parseFloat(document.getElementById(gId).value) || 1;
+    const max = parseInt(document.getElementById(mId).value) || 1;
+    const dot = document.getElementById(dotId);
+    dot.style.left = ((gain - 1) / 9 * 100) + "%";
+    dot.style.top = ((1 - (max - 1) / 14) * 100) + "%";
+    document.getElementById(gvId).textContent = gain;
+    document.getElementById(mvId).textContent = max;
+  }
+  document.getElementById("padimp").classList.toggle(
+    "dis", !document.getElementById("impact").checked);
+}
+function bindPad(padId, gainId, maxId) {
+  const pad = document.getElementById(padId);
+  const apply = (e) => {
+    const r = pad.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    document.getElementById(gainId).value = Math.round((1 + x * 9) * 2) / 2;
+    document.getElementById(maxId).value = Math.round(1 + (1 - y) * 14);
+    padsRender();
+    clearTimeout(audioTimer);
+    audioTimer = setTimeout(audioSend, 180);
+  };
+  pad.onpointerdown = (e) => { pad.setPointerCapture(e.pointerId); apply(e); };
+  pad.onpointermove = (e) => { if (e.buttons & 1) apply(e); };
 }
 
 /* ---- wizard ---- */
 function startWizard() {
   if (!lastStatus) return;
   wizard = {idx: 0, front: new Array(20).fill(null), back: new Array(20).fill(null)};
-  document.getElementById("wizbox").style.display = "block";
+  document.getElementById("wizbox").classList.add("show");
+  document.getElementById("wizbox").scrollIntoView({behavior: "smooth", block: "center"});
   wizardStep();
 }
 function wizardStep() {
@@ -410,50 +854,42 @@ function endWizard() {
   const back = wizard.back.map((v, i) => v === null ? cur.back[i] : v);
   send({SetMapping: {front, back}});
   mappingDirty = false;
-  cancelWizard("wizard done — mapping saved (unclicked cells kept old value)");
+  cancelWizard();
+  toast("wizard done — mapping saved (unclicked cells kept old value)");
 }
-function cancelWizard(msg) {
+function cancelWizard() {
   wizard = null;
-  document.getElementById("wizbox").style.display = "none";
-  document.getElementById("mapinfo").textContent = msg || "wizard cancelled";
+  document.getElementById("wizbox").classList.remove("show");
 }
 
 /* ---- builders ---- */
-function buildGrid(tableId, position, side) {
-  const t = document.getElementById(tableId);
+function buildGrid(elId, position, side) {
+  const el = document.getElementById(elId);
   const prefix = side === "front" ? "gf" : "gb";
-  for (let r = 0; r < 5; r++) {
-    const tr = t.insertRow();
-    for (let c = 0; c < 4; c++) {
-      const i = r * 4 + c;
-      const b = document.createElement("button");
-      b.textContent = i; b.id = prefix + i;
-      b.onclick = () => wizard ? wizardAssign(side, i) : fireDot(position, i);
-      tr.insertCell().appendChild(b);
-    }
+  for (let i = 0; i < 20; i++) {
+    const b = document.createElement("button");
+    b.className = "motor"; b.textContent = i; b.id = prefix + i;
+    b.onclick = () => wizard ? wizardAssign(side, i) : fireDot(position, i);
+    el.appendChild(b);
   }
 }
 function buildRaw() {
   const d = document.getElementById("rawbtns");
   for (let i = 0; i < 40; i++) {
     const b = document.createElement("button");
-    b.textContent = i; b.id = "raw" + i;
+    b.className = "motor"; b.textContent = i; b.id = "raw" + i;
     b.onclick = () => fireRaw(i);
     d.appendChild(b);
-    if (i % 10 === 9) d.appendChild(document.createElement("br"));
   }
 }
-function buildMapGrid(tableId) {
-  const t = document.getElementById(tableId);
-  for (let r = 0; r < 5; r++) {
-    const tr = t.insertRow();
-    for (let c = 0; c < 4; c++) {
-      const inp = document.createElement("input");
-      inp.type = "number"; inp.min = 0; inp.max = 39;
-      inp.dataset.dot = r * 4 + c;
-      inp.onchange = mapChanged;
-      tr.insertCell().appendChild(inp);
-    }
+function buildMapGrid(elId) {
+  const el = document.getElementById(elId);
+  for (let i = 0; i < 20; i++) {
+    const inp = document.createElement("input");
+    inp.type = "number"; inp.min = 0; inp.max = 39;
+    inp.dataset.dot = i;
+    inp.onchange = mapChanged;
+    el.appendChild(inp);
   }
 }
 function fillMapping(st) {
@@ -477,7 +913,8 @@ function saveMapping() {
   };
   send({SetMapping: {front: read("mfront"), back: read("mback")}});
   mappingDirty = false;
-  document.getElementById("mapinfo").textContent = "saved " + new Date().toLocaleTimeString();
+  document.getElementById("mapinfo").textContent = "";
+  toast("mapping saved");
 }
 function flipMap(tid) {
   const inputs = [...document.querySelectorAll(`#${tid} input`)];
@@ -504,22 +941,18 @@ async function sweep() {
 const newFrame = () => ({ms: 150, front: new Array(20).fill(0), back: new Array(20).fill(0)});
 let fx = {frames: [newFrame()], cur: 0};
 
-function buildPaint(tableId, side) {
-  const t = document.getElementById(tableId);
-  for (let r = 0; r < 5; r++) {
-    const tr = t.insertRow();
-    for (let c = 0; c < 4; c++) {
-      const i = r * 4 + c;
-      const b = document.createElement("button");
-      b.textContent = i; b.id = "p" + side[0] + i;
-      b.onclick = () => {
-        const arr = fx.frames[fx.cur][side];
-        const v = intensity() / 100;
-        arr[i] = Math.abs(arr[i] - v) < 0.01 ? 0 : v;
-        fxRender();
-      };
-      tr.insertCell().appendChild(b);
-    }
+function buildPaint(elId, side) {
+  const el = document.getElementById(elId);
+  for (let i = 0; i < 20; i++) {
+    const b = document.createElement("button");
+    b.className = "motor"; b.textContent = i; b.id = "p" + side[0] + i;
+    b.onclick = () => {
+      const arr = fx.frames[fx.cur][side];
+      const v = intensity() / 100;
+      arr[i] = Math.abs(arr[i] - v) < 0.01 ? 0 : v;
+      fxRender();
+    };
+    el.appendChild(b);
   }
 }
 function fxRender() {
@@ -528,8 +961,14 @@ function fxRender() {
     for (let i = 0; i < 20; i++) {
       const b = document.getElementById("p" + side[0] + i);
       const v = f[side][i];
-      b.style.background = v > 0 ? `rgba(255,180,84,${0.25 + 0.75 * v})` : "";
-      b.style.color = v > 0 ? "#1a1205" : "";
+      if (v > 0) {
+        b.style.background = `rgba(255,180,84,${0.25 + 0.75 * v})`;
+        b.style.boxShadow = `0 0 ${4 + v * 12}px rgba(255,180,84,${0.25 + 0.75 * v})`;
+        b.style.color = "#1a1205";
+        b.style.borderColor = "var(--warn)";
+      } else {
+        b.style.background = ""; b.style.boxShadow = ""; b.style.color = ""; b.style.borderColor = "";
+      }
     }
   document.getElementById("fxlabel").textContent = `frame ${fx.cur + 1}/${fx.frames.length}`;
   document.getElementById("fxms").value = f.ms;
@@ -552,9 +991,9 @@ function fxPlayAll() {
 }
 function fxSave() {
   const n = document.getElementById("fxname").value.trim();
-  if (!n) { document.getElementById("fxinfo").textContent = "give it a name first"; return; }
+  if (!n) { toast("give the effect a name first", true); return; }
   send({SaveEffect: {name: n, frames: fx.frames}});
-  document.getElementById("fxinfo").textContent = `saved "${n}"`;
+  toast(`effect "${n}" saved`);
 }
 function fxPlaySel() {
   const n = document.getElementById("fxsel").value;
@@ -566,18 +1005,10 @@ function fxLoad() {
 }
 function fxDelete() {
   const n = document.getElementById("fxsel").value;
-  if (n && confirm(`Delete effect "${n}"?`)) send({DeleteEffect: n});
+  if (n && confirm(`Delete effect "${n}"?`)) { send({DeleteEffect: n}); toast(`effect "${n}" deleted`); }
 }
 function fillEffects(names) {
-  const sel = document.getElementById("fxsel");
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">— saved effects —</option>';
-  for (const n of names || []) {
-    const o = document.createElement("option");
-    o.value = n; o.textContent = n;
-    sel.appendChild(o);
-  }
-  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  fillSelect("fxsel", names, "— saved effects —");
 }
 function loadEffect(eff) {
   if (!eff.frames || !eff.frames.length) return;
@@ -585,9 +1016,113 @@ function loadEffect(eff) {
     ms: f.ms, front: (f.front.concat(new Array(20).fill(0))).slice(0, 20),
     back: (f.back.concat(new Array(20).fill(0))).slice(0, 20)})), cur: 0};
   document.getElementById("fxname").value = eff.name;
-  document.getElementById("fxinfo").textContent = `loaded "${eff.name}"`;
+  toast(`effect "${eff.name}" loaded`);
   fxRender();
 }
+
+/* ---- mod patterns & sdk2 events ---- */
+function fillSelect(selId, names, placeholder) {
+  const sel = document.getElementById(selId);
+  const cur = sel.value;
+  sel.innerHTML = "";
+  const p = document.createElement("option");
+  p.value = ""; p.textContent = placeholder;
+  sel.appendChild(p);
+  for (const n of names || []) {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n;
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+function importTact(fileList) {
+  const files = [...(fileList || document.getElementById("tactfile").files)]
+    .filter(f => /\.(tact|json)$/i.test(f.name) && f.size < 8e6);
+  if (!files.length) { toast("no .tact/.json files there", true); return; }
+  toast(`scanning ${files.length} file${files.length === 1 ? "" : "s"}…`);
+  for (const f of files) {
+    f.text().then(txt => {
+      try {
+        send({ImportTact: {name: f.name.replace(/\.(tact|json)$/i, ""),
+                           project: JSON.parse(txt)}});
+      } catch (e) { /* not JSON — daemon never sees it */ }
+    });
+  }
+}
+let impSkip = 0, impOk = 0, impTimer = null;
+function importNote(note) {
+  if (/no haptic patterns found/.test(note)) impSkip++;
+  else { impOk++; toast(note); }
+  clearTimeout(impTimer);
+  impTimer = setTimeout(() => {
+    if (impSkip) toast(`${impSkip} file${impSkip === 1 ? " had" : "s had"} no haptic data`, !impOk);
+    impSkip = impOk = 0;
+  }, 900);
+}
+function patPlay() {
+  const n = document.getElementById("patsel").value;
+  if (n) send({Submit: [{Type: "key", Key: n}]});
+}
+function patDelete() {
+  const n = document.getElementById("patsel").value;
+  if (n && confirm(`Delete pattern "${n}"?`)) { send({DeletePattern: n}); toast(`pattern "${n}" deleted`); }
+}
+function evPlay() {
+  const n = document.getElementById("evsel").value;
+  if (n) send({PlayEvent: n});
+}
+let doctorGames = {};
+function doctorScan() {
+  toast("scanning your Steam library for bhaptics games…");
+  send({DoctorScan: true});
+}
+function doctorFix(appid) {
+  const b = document.getElementById("gfix" + appid);
+  if (b) { b.disabled = true; b.textContent = "fixing…"; }
+  send({DoctorFix: appid});
+}
+function renderGames() {
+  const box = document.getElementById("games");
+  box.innerHTML = "";
+  const games = Object.values(doctorGames)
+    .sort((a, b) => (a.ok - b.ok) || a.name.localeCompare(b.name));
+  for (const g of games) {
+    const row = document.createElement("div");
+    row.className = "gamerow";
+    const name = document.createElement("span");
+    name.className = "gname"; name.textContent = g.name;
+    const chip = document.createElement("span");
+    chip.className = "kchip" + (g.kind === "mod" ? " mod" : "");
+    chip.textContent = g.kind === "mod" ? "mod" : (g.native ? "native · built-in" : "built-in");
+    const stat = document.createElement("span");
+    const bits = [...(g.issues || []), ...(g.manual || [])];
+    if (g.anticheat) {
+      stat.className = "gstat warn";
+      stat.textContent = "🛡 anti-cheat — left untouched";
+    } else {
+      stat.className = "gstat " + (g.ok ? "ok" : "warn");
+      stat.textContent = g.ok ? "✓ ready" : bits.join(" · ");
+    }
+    row.append(name, chip, stat);
+    if (!g.anticheat && !g.ok && (g.issues || []).length) {
+      const b = document.createElement("button");
+      b.className = "small"; b.id = "gfix" + g.appid; b.textContent = "Fix";
+      b.onclick = () => doctorFix(g.appid);
+      row.appendChild(b);
+    }
+    if (g.launch) row.title = "optional launch options: " + g.launch;
+    box.appendChild(row);
+  }
+}
+
+/* ---- nav scrollspy ---- */
+const navLinks = [...document.querySelectorAll(".nav a")];
+const spy = new IntersectionObserver((entries) => {
+  for (const e of entries)
+    if (e.isIntersecting)
+      navLinks.forEach(l => l.classList.toggle("on", l.hash === "#" + e.target.id));
+}, {rootMargin: "-35% 0px -60% 0px"});
+document.querySelectorAll("main section").forEach(s => spy.observe(s));
 
 buildGrid("gfront", "VestFront", "front");
 buildGrid("gback", "VestBack", "back");
@@ -596,6 +1131,9 @@ buildMapGrid("mfront");
 buildMapGrid("mback");
 buildPaint("pfront", "front");
 buildPaint("pback", "back");
+bindPad("padrum", "again", "amax");
+bindPad("padimp", "igain", "imax");
+padsRender();
 fxRender();
 connect();
 </script>
