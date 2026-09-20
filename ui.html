@@ -390,6 +390,20 @@
       <span class="lr">L</span><div class="outbar"><div id="impl" class="imp"></div></div>
       <span class="lr">R</span><div class="outbar"><div id="impr" class="imp"></div></div>
     </div>
+    <div class="lane" id="rearlane" style="display:none"><span class="lanelabel">rear</span>
+      <span class="lr">L</span><div class="outbar"><div id="outbl"></div></div>
+      <span class="lr">R</span><div class="outbar"><div id="outbr"></div></div>
+    </div>
+
+    <label class="tog" style="margin-top:14px"><span class="switch"><input type="checkbox" id="agc" checked onchange="audioSend()"><i></i></span>
+      auto-scale — adapts to each game's mix so loud music can't spam the vest</label>
+    <div class="lane" id="actlane" style="align-items:center">
+      <span class="lanelabel">activity</span>
+      <input type="range" id="activity" min="1" max="10" step="0.5" value="5" style="flex:1"
+        oninput="document.getElementById('activityv').textContent = this.value"
+        onchange="audioSend()">
+      <b class="num" id="activityv">5</b>/10 <span class="hint" id="dutyv" style="margin-left:8px"></span>
+    </div>
 
     <div class="groups" style="margin-top:16px">
       <div class="group">
@@ -436,6 +450,11 @@
         </div>
         <div class="hint" style="margin:10px 0 0">pick the game's own stream so voice chat
           and music don't buzz you</div>
+        <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="surround" onchange="audioSend()"><i></i></span>
+          surround positioning — rear audio rumbles your back panel</label>
+        <div class="hint" id="surhint" style="margin:6px 0 0; display:none">rear channels are
+          silent — set the game's audio output to 5.1/surround (its stream now plays through
+          the Vest-5.1 device)</div>
       </div>
 
       <div class="group">
@@ -641,6 +660,12 @@ function connect() {
         document.getElementById("igain").value = msg.AudioImpGain;
         document.getElementById("imax").value = msg.AudioImpMax;
       }
+      if ("AudioAgc" in msg) document.getElementById("agc").checked = !!msg.AudioAgc;
+      if ("AudioSurround" in msg) document.getElementById("surround").checked = !!msg.AudioSurround;
+      if ("AudioActivity" in msg) {
+        document.getElementById("activity").value = msg.AudioActivity;
+        document.getElementById("activityv").textContent = msg.AudioActivity;
+      }
       padsRender();
       const src = document.getElementById("asrc");
       if (![...src.options].some(o => o.value === msg.AudioSource)) {
@@ -697,6 +722,15 @@ function updateMeter(m) {
   document.getElementById("asup").textContent =
     m.suppressed ? "⏸ paused — game connected"
     : m.waiting ? "⏳ waiting for the selected app to play audio…" : "";
+  document.getElementById("dutyv").textContent =
+    m.agc && m.on ? "rumbling " + Math.round((m.duty || 0) * 100) + "% of the time" : "";
+  document.getElementById("rearlane").style.display = m.surround ? "" : "none";
+  if (m.surround) {
+    document.getElementById("outbl").style.width = ((m.outBL || 0) * 100) + "%";
+    document.getElementById("outbr").style.width = ((m.outBR || 0) * 100) + "%";
+  }
+  document.getElementById("surhint").style.display =
+    m.surround && m.on && !m.rearLive ? "" : "none";
   const rl = Math.max(m.outL || 0, m.outR || 0);
   document.getElementById("dotrum").style.boxShadow =
     rl > 0.02 ? `0 0 ${8 + rl * 30}px rgba(77,163,255,${0.4 + 0.6 * rl})` : "";
@@ -725,6 +759,9 @@ function audioSend() {
                     impGain: parseFloat(document.getElementById("igain").value) || 5,
                     impMax: parseInt(document.getElementById("imax").value) || 6,
                     auto: document.getElementById("autoprof").checked,
+                    agc: document.getElementById("agc").checked,
+                    activity: parseFloat(document.getElementById("activity").value) || 5,
+                    surround: document.getElementById("surround").checked,
                     source: document.getElementById("asrc").value || "default"}});
   padsRender();
 }
@@ -802,6 +839,13 @@ function padsRender() {
   }
   document.getElementById("padimp").classList.toggle(
     "dis", !document.getElementById("impact").checked);
+  const agc = document.getElementById("agc").checked;
+  document.getElementById("actlane").style.display = agc ? "" : "none";
+  // in auto mode the x-axis (sensitivity) is engine-driven; strength still applies
+  document.getElementById("againv").textContent =
+    agc ? "auto" : document.getElementById("again").value;
+  document.getElementById("igainv").textContent =
+    agc ? "auto" : document.getElementById("igain").value;
 }
 function bindPad(padId, gainId, maxId) {
   const pad = document.getElementById(padId);

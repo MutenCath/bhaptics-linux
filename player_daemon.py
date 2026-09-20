@@ -42,6 +42,8 @@ except ImportError:  # pad mirror simply stays unavailable
 
 log = logging.getLogger("bhaptics-daemon")
 
+__version__ = "0.0.1"
+
 BASE_DIR = Path(__file__).resolve().parent
 UI_FILE = BASE_DIR / "ui.html"
 
@@ -409,6 +411,25 @@ OSC_PORT = 9001  # VRChat sends avatar parameters here
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
 
 
+SUR_SINK = "vest51"
+SUR_MAP = "front-left,front-right,front-center,lfe,rear-left,rear-right"
+
+
+def pactl(*args):
+    return subprocess.run(["pactl", *args],
+                          capture_output=True, text=True).stdout
+
+
+def sink_inputs():
+    """Parsed `pactl list sink-inputs`; [] when pactl fails."""
+    try:
+        return json.loads(subprocess.run(
+            ["pactl", "-f", "json", "list", "sink-inputs"],
+            capture_output=True, text=True).stdout)
+    except Exception:
+        return []
+
+
 class AudioEngine:
     """Captures the default sink monitor, exposes bass level as 0..1."""
 
@@ -432,6 +453,15 @@ class AudioEngine:
         self.impact_max = 6
         self.impact_l = 0.0
         self.impact_r = 0.0
+        self.agc = True  # auto-scale: adapt thresholds to the game's mix
+        self.activity = 5.0  # 1-10 target: how busy the vest should feel
+        self.duty = 0.0  # measured fraction of time the vest is rumbling
+        self.surround = False  # 5.1 capture: rear channels drive the back panel
+        self.rear_live = False  # rear channels actually carrying audio
+        self.level_bl = self.level_br = 0.0
+        self.band_bl = [0.0, 0.0, 0.0]
+        self.band_br = [0.0, 0.0, 0.0]
+        self.impact_bl = self.impact_br = 0.0
         self._task = None
         self._proc = None
         self.source = "default"
@@ -453,6 +483,9 @@ class AudioEngine:
                 self.auto_profiles = bool(c.get("auto", True))
                 self.spread = bool(c.get("spread", False))
                 self.pad_mirror = bool(c.get("pad", False))
+                self.agc = bool(c.get("agc", self.agc))
+                self.activity = float(c.get("activity", self.activity))
+                self.surround = bool(c.get("surround", False))
         # legacy raw stream indexes don't survive reboots (appname: does)
         if self.source.startswith("app:"):
             self.source = "default"
@@ -464,7 +497,9 @@ class AudioEngine:
                 "enabled": self.enabled, "source": self.source,
                 "impact": self.impact, "impGain": self.impact_gain,
                 "impMax": self.impact_max, "auto": self.auto_profiles,
-                "spread": self.spread, "pad": self.pad_mirror}
+                "spread": self.spread, "pad": self.pad_mirror,
+                "agc": self.agc, "activity": self.activity,
+                "surround": self.surround}
 
     async def set_enabled(self, on):
         if on and not self.enabled:
@@ -477,18 +512,64 @@ class AudioEngine:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._stop_proc()
-            self.level_l = self.level_r = self.rel = 0.0
-            self.impact_l = self.impact_r = 0.0
-            self.band_l = [0.0, 0.0, 0.0]
-            self.band_r = [0.0, 0.0, 0.0]
+            self._zero_levels()
             self.waiting = False
             log.info("audio mode OFF")
+
+    def _zero_levels(self):
+        self.level_l = self.level_r = self.rel = 0.0
+        self.level_bl = self.level_br = 0.0
+        self.impact_l = self.impact_r = 0.0
+        self.impact_bl = self.impact_br = 0.0
+        self.band_l = [0.0, 0.0, 0.0]
+        self.band_r = [0.0, 0.0, 0.0]
+        self.band_bl = [0.0, 0.0, 0.0]
+        self.band_br = [0.0, 0.0, 0.0]
 
     def _stop_proc(self):
         if self._proc is not None:
             with contextlib.suppress(ProcessLookupError):
                 self._proc.terminate()
             self._proc = None
+
+    @staticmethod
+    def _sink_id(name):
+        for line in pactl("list", "short", "sinks").splitlines():
+            parts = line.split()
+            if len(parts) > 1 and parts[1] == name:
+                return int(parts[0])
+        return None
+
+    def _ensure_surround_sink(self):
+        """Virtual 5.1 sink + low-latency loopback to the real output.
+
+        Games render true surround into it; we capture all 6 channels for
+        positional haptics while the loopback keeps the audio audible. The
+        modules live in PipeWire, so sound survives a daemon restart."""
+        sid = self._sink_id(SUR_SINK)
+        if sid is None:
+            pactl("load-module", "module-null-sink",
+                  f"sink_name={SUR_SINK}", "rate=48000",
+                  f"channel_map={SUR_MAP}",
+                  "sink_properties=device.description=Vest-5.1")
+            sid = self._sink_id(SUR_SINK)
+        if f"source={SUR_SINK}.monitor" not in pactl("list", "short", "modules"):
+            pactl("load-module", "module-loopback",
+                  f"source={SUR_SINK}.monitor", "latency_msec=20")
+        return sid
+
+    def teardown_surround(self):
+        """Move streams back to the default sink and unload our modules."""
+        sid = self._sink_id(SUR_SINK)
+        if sid is not None:
+            default = pactl("get-default-sink").strip()
+            if default:
+                for si in sink_inputs():
+                    if si.get("sink") == sid:
+                        pactl("move-sink-input", str(si["index"]), default)
+        for line in pactl("list", "short", "modules").splitlines():
+            if SUR_SINK in line:
+                pactl("unload-module", line.split()[0])
 
     def _resolve_target(self):
         """Translate self.source into parec args; None if not available yet."""
@@ -497,25 +578,21 @@ class AudioEngine:
             return ["-d", src[5:] + ".monitor"]
         if src.startswith("appname:"):
             name = src[8:].lower()
-            try:
-                inputs = json.loads(subprocess.run(
-                    ["pactl", "-f", "json", "list", "sink-inputs"],
-                    capture_output=True, text=True).stdout)
-            except Exception:
-                return None
-            for si in inputs:
+            for si in sink_inputs():
                 props = si.get("properties", {})
                 app = (props.get("application.name")
                        or props.get("application.process.binary") or "")
                 if app.lower() == name:
+                    if self.surround:
+                        sid = self._ensure_surround_sink()
+                        if sid is not None and si.get("sink") != sid:
+                            pactl("move-sink-input", str(si["index"]), SUR_SINK)
+                        return ["-d", f"{SUR_SINK}.monitor"]
                     return [f"--monitor-stream={si['index']}"]
             return None
         if src.startswith("app:"):  # legacy raw index
             return [f"--monitor-stream={src[4:]}"]
-        sink = subprocess.run(
-            ["pactl", "get-default-sink"], capture_output=True, text=True
-        ).stdout.strip()
-        return ["-d", sink + ".monitor"]
+        return ["-d", pactl("get-default-sink").strip() + ".monitor"]
 
     async def _run(self):
         """Capture supervisor: waits for the source, rebinds when streams die."""
@@ -532,24 +609,48 @@ class AudioEngine:
                 continue
             announced = False
             self.waiting = False
+            surround = self.surround
+            chans = (["--channels=6", f"--channel-map={SUR_MAP}"] if surround
+                     else ["--channels=2"])
             self._proc = await asyncio.create_subprocess_exec(
-                "parec", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=2",
+                "parec", "--format=s16le", f"--rate={AUDIO_RATE}", *chans,
                 "--latency-msec=20", *target,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
-            log.info("audio capture started (%s)", " ".join(target))
-            await self._pump()
+            log.info("audio capture started (%s%s)", " ".join(target),
+                     " [5.1]" if surround else "")
+            await self._pump(surround)
             self._stop_proc()
             await asyncio.sleep(1)
 
-    async def _pump(self):
+    async def _pump(self, surround=False):
         n_bands = 3  # sub (~25-75 Hz), bass (~75-125), lowmid (~125-275)
-        sm_l = [0.0] * n_bands
-        sm_r = [0.0] * n_bands
+        nsig = 4 if surround else 2  # quadrant signals: FL, FR[, BL, BR]
+        pairs = ((0, 1), (2, 3)) if surround else ((0, 1),)  # L/R per panel
+        sm = [[0.0] * n_bands for _ in range(nsig)]
         peak = 1e-3
-        hf_base_l = hf_base_r = 0.0
+        hf_base = [0.0] * nsig
         hf_peak = 1e-3
-        imp_l = imp_r = 0.0
+        imp = [0.0] * nsig
+        front_ema = rear_ema = 0.0
+        def manual_thresh():
+            return min(0.9, max(0.06, 0.9 - 0.09 * self.gain))
+
+        def manual_ithresh():
+            return min(0.65, max(0.05, 0.65 - 0.055 * self.impact_gain))
+
+        # AGC (auto-scale) state: thresholds drift to hit an activity target
+        # instead of tracking the sliders, so a loud mix stops buzzing
+        # constantly and a quiet one still gets through. ~50 frames/s.
+        auto_thresh = manual_thresh()
+        auto_ithresh = manual_ithresh()
+        duty = 0.0       # EMA of "vest is rumbling" (tau ~5 s)
+        imp_rate = 0.0   # EMA of impact triggers per frame
+        # rolling loudness estimates (tau ~10 s) let auto mode *guess* the
+        # game's scale: they adapt the silence gate down for quiet games and
+        # re-anchor the peak reference after e.g. a loud intro screen
+        loud_ema = 0.0
+        hf_ema = 0.0
         bin_hz = AUDIO_RATE / AUDIO_CHUNK  # 50 Hz per FFT bin
         band_edges = [(1, 2), (2, 3), (3, 6)]
         hf_lo, hf_hi = int(1000 / bin_hz), int(10000 / bin_hz)
@@ -562,17 +663,23 @@ class AudioEngine:
             hf = float(np.sqrt(np.mean(spectrum[hf_lo:hf_hi] ** 2)) / norm)
             return lows, hf
 
-        frame_bytes = AUDIO_CHUNK * 4
+        def out(v, ref):
+            rel = v / ref
+            if rel <= self.thresh:
+                return 0.0
+            return ((rel - self.thresh) / (1 - self.thresh)) ** 1.5 * (
+                self.max_level / 15.0
+            )
+
+        n_ch = 6 if surround else 2
+        frame_bytes = AUDIO_CHUNK * 2 * n_ch
         buf = bytearray()
         try:
             while True:
                 chunk = await self._proc.stdout.read(65536)
                 if not chunk:
                     log.info("audio stream ended, will rebind")
-                    self.level_l = self.level_r = self.rel = 0.0
-                    self.impact_l = self.impact_r = 0.0
-                    self.band_l = [0.0, 0.0, 0.0]
-                    self.band_r = [0.0, 0.0, 0.0]
+                    self._zero_levels()
                     return
                 buf += chunk
                 if len(buf) < frame_bytes:
@@ -584,84 +691,132 @@ class AudioEngine:
                 del buf[:n * frame_bytes]
                 samples = (
                     np.frombuffer(data, dtype=np.int16)
-                    .reshape(-1, 2).astype(np.float32) / 32768.0
+                    .reshape(-1, n_ch).astype(np.float32) / 32768.0
                 )
-                lows_l, hf_l = bands(samples[:, 0])
-                lows_r, hf_r = bands(samples[:, 1])
+                if surround:
+                    # center and LFE carry no direction: blend into the sides
+                    fc = samples[:, 2] * 0.5
+                    lfe = samples[:, 3] * 0.5
+                    sigs = [samples[:, 0] + fc + lfe, samples[:, 1] + fc + lfe,
+                            samples[:, 4] + lfe, samples[:, 5] + lfe]
+                else:
+                    sigs = [samples[:, 0], samples[:, 1]]
+                res = [bands(s) for s in sigs]
+                lows = [r[0] for r in res]
+                hfs = [r[1] for r in res]
                 if not self.stereo:
-                    lows_l = lows_r = [max(a, b) for a, b in zip(lows_l, lows_r)]
-                    hf_l = hf_r = max(hf_l, hf_r)
+                    for a, b in pairs:
+                        merged = [max(x, y) for x, y in zip(lows[a], lows[b])]
+                        lows[a] = lows[b] = merged
+                        hfs[a] = hfs[b] = max(hfs[a], hfs[b])
+                if surround:
+                    # stereo-only games leave the rear silent: detect that and
+                    # let the mixer mirror the front instead of a dead back
+                    front_ema = front_ema * 0.995 + 0.005 * (
+                        max(lows[0]) + max(lows[1]) + hfs[0] + hfs[1])
+                    rear_ema = rear_ema * 0.995 + 0.005 * (
+                        max(lows[2]) + max(lows[3]) + hfs[2] + hfs[3])
+                    self.rear_live = rear_ema > max(front_ema, 1e-5) * 0.02
+
+                # auto mode lowers the silence gate toward the game's own
+                # loudness so even quiet mixes register; manual keeps the knob
+                gate = (min(self.floor, max(loud_ema * 0.15, 2e-4))
+                        if self.agc else self.floor)
 
                 # impacts: HF onsets (sword hits, gunshots) vs a slow baseline
                 # so sustained noise (music, wind) never triggers
-                imp_l *= 0.55  # fast decay: sharp tap, not a drone
-                imp_r *= 0.55
+                for i in range(nsig):
+                    imp[i] *= 0.55  # fast decay: sharp tap, not a drone
                 if self.impact:
-                    hf_base_l = hf_base_l * 0.985 + hf_l * 0.015
-                    hf_base_r = hf_base_r * 0.985 + hf_r * 0.015
-                    hf_peak = max(hf_peak * 0.99975, hf_l, hf_r)
-                    ithresh = min(0.65, max(0.05, 0.65 - 0.055 * self.impact_gain))
+                    hf_now = max(hfs)
+                    if hf_now > 2e-4:
+                        hf_ema = (hf_now if hf_ema == 0.0
+                                  else hf_ema * 0.998 + hf_now * 0.002)
+                    hf_decay = (0.999 if self.agc and hf_peak > hf_ema * 4
+                                else 0.99975)
+                    hf_peak = max(hf_peak * hf_decay, *hfs)
+                    ithresh = auto_ithresh if self.agc else manual_ithresh()
                     scale = self.impact_max / 15.0
-                    on_l = (hf_l - hf_base_l * 1.5) / hf_peak
-                    on_r = (hf_r - hf_base_r * 1.5) / hf_peak
-                    if hf_l > self.floor * 0.5 and on_l > ithresh:
-                        imp_l = max(imp_l, min(1.0, 0.3 + (on_l - ithresh) / (1 - ithresh)) * scale)
-                    if hf_r > self.floor * 0.5 and on_r > ithresh:
-                        imp_r = max(imp_r, min(1.0, 0.3 + (on_r - ithresh) / (1 - ithresh)) * scale)
-                self.impact_l = imp_l if imp_l > 0.03 else 0.0
-                self.impact_r = imp_r if imp_r > 0.03 else 0.0
+                    trig = False
+                    for i in range(nsig):
+                        hf_base[i] = hf_base[i] * 0.985 + hfs[i] * 0.015
+                        on = (hfs[i] - hf_base[i] * 1.5) / hf_peak
+                        if hfs[i] > gate * 0.5 and on > ithresh:
+                            imp[i] = max(imp[i], min(1.0, 0.3 + (on - ithresh) / (1 - ithresh)) * scale)
+                            trig = True
+                    # rate controller: aim for a taps-per-second budget so a
+                    # drum-heavy mix can't machine-gun the chest, while quiet
+                    # scenes drift back to full sensitivity
+                    if self.agc and max(hfs) > gate * 0.5:
+                        imp_rate = imp_rate * 0.996 + (0.004 if trig else 0.0)
+                        tgt = 0.006 + 0.005 * self.activity
+                        if imp_rate > tgt * 1.4:
+                            auto_ithresh = min(0.85, auto_ithresh + 0.0015)
+                        elif imp_rate < tgt * 0.6:
+                            auto_ithresh = max(0.10, auto_ithresh - 0.0015)
+                self.impact_l = imp[0] if imp[0] > 0.03 else 0.0
+                self.impact_r = imp[1] if imp[1] > 0.03 else 0.0
+                if surround:
+                    self.impact_bl = imp[2] if imp[2] > 0.03 else 0.0
+                    self.impact_br = imp[3] if imp[3] > 0.03 else 0.0
 
                 # bass rumble: fast attack, slower release envelopes, per band
-                sm_l = [max(e, s * 0.90) for e, s in zip(lows_l, sm_l)]
-                sm_r = [max(e, s * 0.90) for e, s in zip(lows_r, sm_r)]
-                loud = max(*sm_l, *sm_r)
-                self.thresh = min(0.9, max(0.06, 0.9 - 0.09 * self.gain))
-                if loud < self.floor:
+                for i in range(nsig):
+                    sm[i] = [max(e, s * 0.90) for e, s in zip(lows[i], sm[i])]
+                loud = max(v for s in sm for v in s)
+                if loud > 2e-4:
+                    loud_ema = (loud if loud_ema == 0.0
+                                else loud_ema * 0.998 + loud * 0.002)
+                self.thresh = auto_thresh if self.agc else manual_thresh()
+                if loud < gate:
                     self.level_l = self.level_r = self.rel = 0.0
+                    self.level_bl = self.level_br = 0.0
                     self.band_l = [0.0] * n_bands
                     self.band_r = [0.0] * n_bands
+                    self.band_bl = [0.0] * n_bands
+                    self.band_br = [0.0] * n_bands
                     continue
                 # slow-decaying loudness reference: react to *relative* loudness
                 # so only the louder beats thump instead of a constant buzz
-                peak = max(peak * 0.99975, loud)
+                # re-anchor quickly when the reference is far above what the
+                # game has been doing lately (loud intro -> quiet gameplay)
+                decay = 0.999 if self.agc and peak > loud_ema * 4 else 0.99975
+                peak = max(peak * decay, loud)
                 self.rel = loud / peak
 
-                def out(sm):
-                    rel = sm / peak
-                    if rel <= self.thresh:
-                        return 0.0
-                    return ((rel - self.thresh) / (1 - self.thresh)) ** 1.5 * (
-                        self.max_level / 15.0
-                    )
-
-                self.band_l = [out(s) for s in sm_l]
-                self.band_r = [out(s) for s in sm_r]
+                outs = [[out(v, peak) for v in s] for s in sm]
+                self.band_l, self.band_r = outs[0], outs[1]
+                if surround:
+                    self.band_bl, self.band_br = outs[2], outs[3]
                 self.level_l = max(self.band_l)
                 self.level_r = max(self.band_r)
+                self.level_bl = max(self.band_bl)
+                self.level_br = max(self.band_br)
+                # duty controller: nudge the threshold until the fraction of
+                # time the vest rumbles matches the activity target. Only runs
+                # while audio is above the floor, so silence never drifts it.
+                if self.agc:
+                    act = max(self.level_l, self.level_r,
+                              self.level_bl, self.level_br)
+                    duty = duty * 0.996 + (0.004 if act > 0.01 else 0.0)
+                    tgt = 0.04 + 0.036 * self.activity
+                    if duty > tgt * 1.25:
+                        auto_thresh = min(0.95, auto_thresh + 0.002)
+                    elif duty < tgt * 0.75:
+                        auto_thresh = max(0.20, auto_thresh - 0.002)
+                    self.duty = duty
         except asyncio.CancelledError:
-            self.level_l = self.level_r = self.rel = 0.0
-            self.impact_l = self.impact_r = 0.0
-            self.band_l = [0.0, 0.0, 0.0]
-            self.band_r = [0.0, 0.0, 0.0]
+            self._zero_levels()
             raise
         except Exception as e:
             log.warning("audio capture error (will retry): %s", e)
-            self.level_l = self.level_r = self.rel = 0.0
-            self.impact_l = self.impact_r = 0.0
-            self.band_l = [0.0, 0.0, 0.0]
-            self.band_r = [0.0, 0.0, 0.0]
+            self._zero_levels()
 
 
 def list_audio_apps():
     """Apps currently playing audio: lowercased name -> original name."""
-    try:
-        inputs = json.loads(subprocess.run(
-            ["pactl", "-f", "json", "list", "sink-inputs"],
-            capture_output=True, text=True).stdout)
-    except Exception:
-        return {}
     out = {}
-    for si in inputs:
+    for si in sink_inputs():
         props = si.get("properties", {})
         app = (props.get("application.name")
                or props.get("application.process.binary") or "")
@@ -705,9 +860,29 @@ class PadMirror:
             log.info("pad mirror OFF")
 
     async def _scan(self):
+        # Poll fast: Steam Input's virtual gamepad only appears at game launch
+        # and the game binds it within ms, so a slow scan misses the window.
+        cooldown = {}  # dev path -> monotonic time its last mirror task ended
+        # probe each node once; inode changes when a device is re-created at
+        # the same path, so genuinely new hardware still gets looked at
+        rejected = set()  # (path, inode) of nodes without rumble
         while True:
+            for path, t in list(self.tasks.items()):
+                if t.done():
+                    self.tasks.pop(path)
+                    self.names.pop(path, None)
+                    cooldown[path] = time.monotonic()
             for path in evdev.list_devices():
-                if path in self.tasks and not self.tasks[path].done():
+                if path in self.tasks:
+                    continue
+                try:
+                    ino = os.stat(path).st_ino
+                except OSError:
+                    continue
+                if (path, ino) in rejected:
+                    continue
+                last = cooldown.get(path)
+                if last is not None and time.monotonic() - last < 10:
                     continue
                 try:
                     dev = evdev.InputDevice(path)
@@ -715,17 +890,14 @@ class PadMirror:
                     if (EC.EV_FF not in caps or EC.FF_RUMBLE not in caps[EC.EV_FF]
                             or "(vest)" in (dev.name or "")):
                         dev.close()
+                        rejected.add((path, ino))
                         continue
                 except OSError:
                     continue
                 self.names[path] = dev.name
                 self.tasks[path] = asyncio.create_task(self._mirror(path, dev))
                 log.info("pad mirror: attached to %s (%s)", dev.name, path)
-            for path, t in list(self.tasks.items()):
-                if t.done():
-                    self.tasks.pop(path)
-                    self.names.pop(path, None)
-            await asyncio.sleep(4)
+            await asyncio.sleep(0.5)
 
     async def _mirror(self, path, dev):
         ui = None
@@ -1008,6 +1180,9 @@ class PlayerState:
                 "AudioSource": self.audio.source,
                 "AudioAuto": self.audio.auto_profiles,
                 "AudioSpread": self.audio.spread,
+                "AudioAgc": self.audio.agc,
+                "AudioActivity": self.audio.activity,
+                "AudioSurround": self.audio.surround,
                 "AutoProfileApp": self.auto_profile_app,
                 "PadMirror": self.audio.pad_mirror,
                 "PadDevices": sorted(self.pad.names.values()),
@@ -1020,6 +1195,7 @@ class PlayerState:
                 "Sdk2Events": sorted(self.sdk2_events),
                 "MissingKeys": sorted(self.missing_keys),
                 "Battery": self.vest.battery,
+                "Version": __version__,
             }
         )
 
@@ -1139,9 +1315,9 @@ class PlayerState:
                     timeline += [("mapped", fr, bk)] * max(1, f["ms"] // TICK_MS)
                 self.active[f"fx:{name}"] = Effect(name, timeline)
 
-        if "DeleteEffect" in payload:
-            if self.effects.pop(str(payload["DeleteEffect"]), None) is not None:
-                self._save_effects()
+        if ("DeleteEffect" in payload
+                and self.effects.pop(str(payload["DeleteEffect"]), None) is not None):
+            self._save_effects()
 
         if "ImportTact" in payload:
             it = payload["ImportTact"] or {}
@@ -1213,11 +1389,16 @@ class PlayerState:
         a.impact_max = int(d.get("impMax", a.impact_max))
         a.auto_profiles = bool(d.get("auto", a.auto_profiles))
         a.spread = bool(d.get("spread", a.spread))
+        a.agc = bool(d.get("agc", a.agc))
+        a.activity = min(10.0, max(1.0, float(d.get("activity", a.activity))))
         new_src = str(d.get("source", a.source))
-        if new_src != a.source:
+        new_sur = bool(d.get("surround", a.surround))
+        if new_src != a.source or new_sur != a.surround:
             was_enabled = a.enabled
             await a.set_enabled(False)
-            a.source = new_src
+            if a.surround and not new_sur:
+                a.teardown_surround()
+            a.source, a.surround = new_src, new_sur
             if was_enabled:
                 await a.set_enabled(True)
 
@@ -1392,9 +1573,18 @@ class PlayerState:
 
             a = self.audio
             if (a.enabled and not self.audio_suppressed
-                    and (a.level_l or a.level_r or a.impact_l or a.impact_r)):
+                    and (a.level_l or a.level_r or a.impact_l or a.impact_r
+                         or a.level_bl or a.level_br
+                         or a.impact_bl or a.impact_br)):
                 l, r = a.level_l, a.level_r
                 il, ir = a.impact_l, a.impact_r
+                # surround: rear channels drive the back panel; if the game
+                # only outputs stereo the rear is dead, so mirror the front
+                use_rear = a.surround and a.rear_live
+                bl, br = (a.level_bl, a.level_br) if use_rear else (l, r)
+                ibl, ibr = (a.impact_bl, a.impact_br) if use_rear else (il, ir)
+                bnd_bl = a.band_bl if use_rear else a.band_l
+                bnd_br = a.band_br if use_rear else a.band_r
                 wl = (1.0, 0.67, 0.33, 0.0)  # grid col 0 = wearer's left
                 # spread mode: frequency becomes vertical position —
                 # row 4 (belly) = sub, row 3 = bass, row 2 = lowmid
@@ -1403,16 +1593,18 @@ class PlayerState:
                     w = wl[i % 4]
                     if a.spread:
                         bi = row_band.get(i // 4)
-                        lvl = (a.band_l[bi] * w + a.band_r[bi] * (1 - w)
-                               if bi is not None else 0.0)
+                        f_lvl = (a.band_l[bi] * w + a.band_r[bi] * (1 - w)
+                                 if bi is not None else 0.0)
+                        b_lvl = (bnd_bl[bi] * w + bnd_br[bi] * (1 - w)
+                                 if bi is not None else 0.0)
                     else:
-                        lvl = l * w + r * (1 - w)
-                    front[i] = max(front[i], lvl)
-                    back[i] = max(back[i], lvl)
+                        f_lvl = l * w + r * (1 - w)
+                        b_lvl = bl * w + br * (1 - w)
+                    front[i] = max(front[i], f_lvl)
+                    back[i] = max(back[i], b_lvl)
                     if i < 8:  # impacts hit the upper two rows only
-                        ilvl = il * w + ir * (1 - w)
-                        front[i] = max(front[i], ilvl)
-                        back[i] = max(back[i], ilvl)
+                        front[i] = max(front[i], il * w + ir * (1 - w))
+                        back[i] = max(back[i], ibl * w + ibr * (1 - w))
 
             motors = [0] * 40
             for i in range(20):
@@ -1492,6 +1684,9 @@ class PlayerState:
                     "on": a.enabled, "rel": round(a.rel, 3), "thresh": round(a.thresh, 3),
                     "outL": round(a.level_l, 3), "outR": round(a.level_r, 3),
                     "impL": round(a.impact_l, 3), "impR": round(a.impact_r, 3),
+                    "outBL": round(a.level_bl, 3), "outBR": round(a.level_br, 3),
+                    "duty": round(a.duty, 3), "agc": a.agc,
+                    "surround": a.surround, "rearLive": a.rear_live,
                     "suppressed": self.audio_suppressed,
                     "waiting": a.enabled and a.waiting,
                 }, "Motors": self.last_motors})
