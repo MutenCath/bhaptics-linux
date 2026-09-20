@@ -452,6 +452,9 @@
           and music don't buzz you</div>
         <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="surround" onchange="audioSend()"><i></i></span>
           surround positioning — rear audio rumbles your back panel</label>
+        <button class="small" style="margin-top:8px"
+          onclick="send({SurroundTest: true}); toast('sweep: front-L → front-R → back-R → back-L')">
+          ▶ test surround</button>
         <div class="hint" id="surhint" style="margin:6px 0 0; display:none">rear channels are
           silent — set the game's audio output to 5.1/surround (its stream now plays through
           the Vest-5.1 device)</div>
