@@ -8,3 +8,10 @@ updates:
     directory: /plugin/VestRumble
     schedule:
       interval: monthly
+    ignore:
+      # pinned to the runtimes games actually ship: BepInEx 5.4.x bundles
+      # its own Harmony build, and UnityEngine.Modules must match the
+      # oldest Unity version we target
+      - dependency-name: HarmonyX
+      - dependency-name: BepInEx.BaseLib
+      - dependency-name: UnityEngine.Modules
