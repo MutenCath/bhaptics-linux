@@ -1,0 +1,16 @@
+# fish completions for vestctl (bhaptics-linux)
+complete -c vestctl -f
+complete -c vestctl -n __fish_use_subcommand -a status -d "vest/audio/game status"
+complete -c vestctl -n __fish_use_subcommand -a pulse -d "buzz the vest"
+complete -c vestctl -n __fish_use_subcommand -a stop -d "stop all effects"
+complete -c vestctl -n __fish_use_subcommand -a audio -d "audio mode on/off"
+complete -c vestctl -n __fish_use_subcommand -a auto -d "auto per-game presets on/off"
+complete -c vestctl -n __fish_use_subcommand -a pad -d "gamepad rumble mirror on/off"
+complete -c vestctl -n __fish_use_subcommand -a preset -d "list or apply presets"
+complete -c vestctl -n __fish_use_subcommand -a effect -d "list or play saved effects"
+complete -c vestctl -n __fish_use_subcommand -a play -d "list or play .tact patterns"
+complete -c vestctl -n __fish_use_subcommand -a import -d "import .tact / haptic manifests"
+complete -c vestctl -n __fish_use_subcommand -a sources -d "list audio sources"
+complete -c vestctl -n __fish_use_subcommand -a proton -d "prep a Proton prefix for SDK2 mods"
+complete -c vestctl -n __fish_use_subcommand -a doctor -d "diagnose a game's mod setup"
+complete -c vestctl -n "__fish_seen_subcommand_from audio auto pad" -a "on off"

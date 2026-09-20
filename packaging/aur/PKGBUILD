@@ -41,5 +41,7 @@ package() {
     "$pkgdir/usr/lib/systemd/user/bhaptics-daemon.service"
   install -Dm644 packaging/bhaptics-vest.desktop \
     "$pkgdir/usr/share/applications/bhaptics-vest.desktop"
+  install -Dm644 packaging/vestctl.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/vestctl.fish"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

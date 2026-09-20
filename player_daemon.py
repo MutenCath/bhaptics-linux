@@ -383,7 +383,13 @@ class VestLink:
         with contextlib.suppress(Exception):
             data = await self.client.read_gatt_char(BATTERY_CHAR)
             if data:
+                prev = self.battery if self.battery is not None else 100
                 self.battery = data[0]
+                if self.battery < 15 <= prev and shutil.which("notify-send"):
+                    subprocess.Popen(
+                        ["notify-send", "-u", "critical",
+                         "-i", "battery-caution", "bHaptics vest",
+                         f"Battery at {self.battery}% — plug the vest in"])
 
     async def send(self, motors40):
         if not self.connected:
@@ -1079,6 +1085,7 @@ class PlayerState:
         self.sdk2_events = {}  # eventName -> project dict
         self.auto_profile_app = ""  # display name while an auto profile is active
         self.pad = PadMirror(self)
+        self._surtest = None
         self.patterns = set()  # keys loaded from patterns/*.tact (persisted)
         self.missing_keys = {}  # names games asked for but we don't have
         self.import_note = ""
@@ -1259,6 +1266,10 @@ class PlayerState:
         if "PadMirror" in payload:
             self.audio.pad_mirror = bool(payload["PadMirror"])
             await self.pad.set_enabled(self.audio.pad_mirror)
+
+        if (payload.get("SurroundTest")
+                and (self._surtest is None or self._surtest.done())):
+            self._surtest = asyncio.create_task(self.surround_test())
 
         if "SavePreset" in payload:
             name = str(payload["SavePreset"]).strip()
@@ -1510,6 +1521,56 @@ class PlayerState:
         else:
             log.info("sdk2: unhandled message type %r, raw: %.300s",
                      mtype, json.dumps(payload))
+
+    async def surround_test(self):
+        """Play a 5.1 quadrant sweep into the virtual sink so positional
+        haptics can be verified without configuring any game."""
+        a = self.audio
+        a._ensure_surround_sink()
+        # already capturing vest51 (game routed through it)? just mix in
+        bound = (a.enabled and a.surround and not a.waiting
+                 and (a.source.startswith("appname:")
+                      or a.source == f"sink:{SUR_SINK}"))
+        stash = None
+        if not bound:
+            stash = (a.source, a.surround, a.enabled)
+            await self.apply_audio_settings(
+                {"source": f"sink:{SUR_SINK}", "surround": True})
+            if not a.enabled:
+                await a.set_enabled(True)
+            await asyncio.sleep(1.0)  # let the capture bind before the sweep
+        try:
+            await self._play_sweep()
+        finally:
+            if stash is not None:
+                src, sur, en = stash
+                await self.apply_audio_settings({"source": src, "surround": sur})
+                if not en:
+                    await a.set_enabled(False)
+
+    async def _play_sweep(self):
+        rate = 48000
+        t = np.arange(int(rate * 0.8)) / rate
+        burst = (np.sin(2 * np.pi * 55 * t) * np.hanning(t.size)
+                 * 32000).astype(np.int16)
+        gap = np.zeros((int(rate * 0.25), 6), dtype=np.int16)
+        order = [0, 1, 5, 4]  # FL -> FR -> RR -> RL, clockwise
+        frames = []
+        for ch in order:
+            block = np.zeros((burst.size, 6), dtype=np.int16)
+            block[:, ch] = burst
+            frames.append(block)
+            frames.append(gap)
+        proc = await asyncio.create_subprocess_exec(
+            "pacat", f"--device={SUR_SINK}", "--format=s16le",
+            f"--rate={rate}", "--channels=6", f"--channel-map={SUR_MAP}",
+            "--raw", stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            proc.stdin.write(np.concatenate(frames).tobytes())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        await proc.wait()
 
     def pad_rumble(self, amp, ms):
         """Gamepad FF mirrored to belly/mid rows — rumble, not a tap."""
