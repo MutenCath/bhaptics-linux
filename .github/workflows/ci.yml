@@ -39,7 +39,7 @@ jobs:
           dotnet-version: "8.0.x"
       - name: Build VestRumble plugin
         run: dotnet build -c Release plugin/VestRumble
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: VestRumble.dll
           path: plugin/VestRumble/bin/Release/net46/VestRumble.dll
@@ -59,7 +59,7 @@ jobs:
           chown -R builder .
           cd packaging
           runuser -u builder -- makepkg -f --noconfirm
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arch-package
           path: packaging/*.pkg.tar.zst
