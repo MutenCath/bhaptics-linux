@@ -2,7 +2,7 @@
 # (alternative to ./install.sh; disable the user unit from install.sh first:
 #  systemctl --user disable --now bhaptics-daemon)
 pkgname=bhaptics-linux
-pkgver=0.2.0
+pkgver=0.0.1
 pkgrel=1
 pkgdesc="bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio -> BLE, no Windows Player"
 arch=(any)
@@ -18,6 +18,11 @@ package() {
     "$pkgdir/usr/lib/bhaptics-linux/tools/proton-sdk2-setup.sh"
   install -Dm755 "$src/tools/proton-wrap.sh" \
     "$pkgdir/usr/lib/bhaptics-linux/tools/proton-wrap.sh"
+  local dll="$src/plugin/VestRumble/bin/Release/net46/VestRumble.dll"
+  if [[ -f "$dll" ]]; then
+    install -Dm644 "$dll" \
+      "$pkgdir/usr/lib/bhaptics-linux/plugin/VestRumble/bin/Release/net46/VestRumble.dll"
+  fi
   install -Dm755 "$src/vestctl.py" "$pkgdir/usr/bin/vestctl"
   install -Dm644 "$src/packaging/bhaptics-daemon.service" \
     "$pkgdir/usr/lib/systemd/user/bhaptics-daemon.service"

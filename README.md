@@ -1,5 +1,7 @@
 # bhaptics-linux
 
+[![CI](https://github.com/MutenCath/bhaptics-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/MutenCath/bhaptics-linux/actions/workflows/ci.yml)
+
 **bHaptics TactSuit haptic vests on Linux — no Windows, no bHaptics Player.**
 
 A userspace daemon that talks to the vest directly over Bluetooth LE and

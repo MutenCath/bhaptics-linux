@@ -346,7 +346,10 @@ def generic_profile(token, fix):
     print("[ok] Mono Unity game, no anti-cheat")
 
     base = Path(__file__).resolve().parent
-    plug_dll = base / "plugin" / "VestRumble" / "bin" / "Release" / "net46" / "VestRumble.dll"
+    plug_rel = Path("plugin/VestRumble/bin/Release/net46/VestRumble.dll")
+    # packaged installs put vestctl in /usr/bin with the dll prebuilt in /usr/lib
+    plug_dll = next((c / plug_rel for c in (base, Path("/usr/lib/bhaptics-linux"))
+                     if (c / plug_rel).exists()), base / plug_rel)
     todo = []
 
     if not plug_dll.exists():

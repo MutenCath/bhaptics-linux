@@ -10,3 +10,7 @@ effects.json
 *.log
 plugin/VestRumble/bin/
 plugin/VestRumble/obj/
+packaging/aur/bhaptics-linux-git/
+packaging/aur/pkg/
+packaging/aur/src/
+packaging/aur/*.pkg.tar.*

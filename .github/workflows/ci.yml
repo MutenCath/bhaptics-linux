@@ -1,0 +1,65 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff and runtime deps
+        run: pip install ruff -r requirements.txt
+      - name: Lint
+        run: ruff check player_daemon.py vestctl.py
+      - name: Compile check
+        run: python -m py_compile player_daemon.py vestctl.py
+      - name: Import check
+        run: python -c "import player_daemon, vestctl"
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check ui.html inline JS parses
+        run: |
+          sed -n '/<script>/,/<\/script>/p' ui.html | sed '1d;$d' > /tmp/ui.js
+          node --check /tmp/ui.js
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build VestRumble plugin
+        run: dotnet build -c Release plugin/VestRumble
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VestRumble.dll
+          path: plugin/VestRumble/bin/Release/net46/VestRumble.dll
+
+  package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: >
+          pacman -Syu --noconfirm python python-websockets python-bleak
+          python-numpy python-evdev bluez libpulse openssl
+      - name: Build Arch package
+        run: |
+          useradd -m builder
+          chown -R builder .
+          cd packaging
+          runuser -u builder -- makepkg -f --noconfirm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: packaging/*.pkg.tar.zst

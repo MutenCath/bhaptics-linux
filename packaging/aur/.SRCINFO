@@ -1,0 +1,25 @@
+pkgbase = bhaptics-linux-git
+	pkgdesc = bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio-to-haptics over BLE, no Windows Player needed
+	pkgver = 0.0.1.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/MutenCath/bhaptics-linux
+	arch = any
+	license = GPL-3.0-or-later
+	makedepends = git
+	makedepends = dotnet-sdk
+	depends = python
+	depends = python-websockets
+	depends = python-bleak
+	depends = python-numpy
+	depends = python-evdev
+	depends = bluez
+	depends = libpulse
+	depends = openssl
+	optdepends = pipewire-pulse: audio-to-haptics capture (or pulseaudio)
+	optdepends = dotnet-sdk: rebuild the VestRumble generic Unity plugin
+	provides = bhaptics-linux
+	conflicts = bhaptics-linux
+	source = bhaptics-linux-git::git+https://github.com/MutenCath/bhaptics-linux.git
+	sha256sums = SKIP
+
+pkgname = bhaptics-linux-git
