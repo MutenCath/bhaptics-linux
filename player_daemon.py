@@ -831,6 +831,20 @@ def list_audio_apps():
     return out
 
 
+# never auto-bind audio capture to these (browsers, comms, media players,
+# our own test tone players) — everything else is assumed to be a game
+NON_GAME_APPS = {
+    "brave", "firefox", "chromium", "chrome", "google chrome", "vivaldi",
+    "opera", "microsoft edge", "discord", "vesktop", "webcord", "spotify",
+    "mpv", "vlc", "vlc media player", "telegram", "telegram desktop",
+    "obs", "zoom", "slack", "signal", "easyeffects", "pavucontrol",
+    "kodi", "steam", "pacat", "paplay", "parec", "pw-play", "pw-cat",
+    "speech-dispatcher", "plasmashell", "gnome-shell", "kwin_wayland",
+    "xdg-desktop-portal", "steamvr", "vrwebhelper", "vrserver",
+    "vrmonitor", "vrcompositor", "vrdashboard",
+}
+
+
 class PadMirror:
     """Mirror gamepad force-feedback to the vest.
 
@@ -1688,6 +1702,11 @@ class PlayerState:
         Name a preset after the app shown in `vestctl sources` (case-insensitive)
         and it gets applied — source bound to that app — the moment the game
         makes sound; the previous audio setup is restored when it exits.
+
+        Fallback when no preset matches: any new app that isn't an obvious
+        non-game (NON_GAME_APPS) gets the capture bound to it with the current
+        slider settings, so unsupported games buzz via audio mode with zero
+        setup. Same restore-on-exit and hands-off-on-user-override rules.
         """
         loop = asyncio.get_running_loop()
         current = None  # {"app", "preset", "saved", "saved_enabled", "saved_preset"}
@@ -1709,10 +1728,10 @@ class PlayerState:
                     await a.set_enabled(current["saved_enabled"])
                     self.active_preset = current["saved_preset"]
                     log.info("auto profile: %r closed, previous audio setup restored",
-                             current["preset"])
+                             current["preset"] or current["app"])
                     current = None
                     self.auto_profile_app = ""
-                elif (self.active_preset != current["preset"]
+                elif (self.active_preset != (current["preset"] or "")
                       or a.source != expect_src or not a.enabled):
                     # user changed preset/source/off while active: hands off
                     suppressed.add(current["app"])
@@ -1735,6 +1754,26 @@ class PlayerState:
                            "saved_enabled": saved_enabled, "saved_preset": saved_preset}
                 self.auto_profile_app = apps[key]
                 log.info("auto profile: %r applied for %s", name, apps[key])
+                break
+            if current or self.audio_suppressed:
+                continue
+            bound = (a.source[len("appname:"):].lower()
+                     if a.source.startswith("appname:") else None)
+            if bound and bound in apps:
+                continue  # bound app still playing — nothing to take over
+            for key in sorted(apps):
+                if key in suppressed or key in NON_GAME_APPS:
+                    continue
+                saved = a.settings()
+                saved_enabled = a.enabled
+                saved_preset = self.active_preset
+                await self.apply_audio_settings({"source": "appname:" + apps[key]})
+                await a.set_enabled(True)
+                self.active_preset = ""
+                current = {"app": key, "preset": None, "saved": saved,
+                           "saved_enabled": saved_enabled, "saved_preset": saved_preset}
+                self.auto_profile_app = apps[key]
+                log.info("auto follow: audio mode bound to %s", apps[key])
                 break
 
     async def meter_loop(self):
@@ -1939,13 +1978,18 @@ async def main():
         asyncio.create_task(state.autoprofile_loop()),
     ]
 
-    # big max_size: definition manifests and Register payloads can be MBs
+    # big max_size: definition manifests and Register payloads can be MBs.
+    # ping_interval=None: game SDK clients don't answer RFC6455 pings (the
+    # official Player never sends any), so the default 20s ping + 20s timeout
+    # killed every game connection after exactly 40s.
     async with websockets.serve(
         lambda ws: ws_handler(ws, state), "127.0.0.1", 15881,
         process_request=process_request, max_size=16 * 2**20,
+        ping_interval=None,
     ), websockets.serve(
         lambda ws: sdk2_handler(ws, state), "127.0.0.1", 15882,
         ssl=sdk2_ssl_context(), max_size=16 * 2**20,
+        ping_interval=None,
     ):
         log.info("SDK1 on ws://127.0.0.1:15881/v2/feedbacks — UI at http://127.0.0.1:15881/ui")
         log.info("SDK2 on wss://127.0.0.1:15882/v3/feedback")
