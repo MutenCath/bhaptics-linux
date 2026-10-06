@@ -150,11 +150,13 @@ systemctl --user restart bhaptics-daemon
 `BHAPTICS_BIND` in the environment overrides that file for manual runs; to set
 it on the service instead, add `Environment=BHAPTICS_BIND=0.0.0.0` via
 `systemctl --user edit bhaptics-daemon`. The web UI stays loopback-only
-regardless. On the **gaming PC**, run the relay
-so unmodified games still find the Player at 127.0.0.1:
+regardless. On the **gaming PC**, run the relay so unmodified games still find
+the Player at 127.0.0.1 — it auto-discovers the device on the LAN:
 
 ```sh
-tools/remote-relay.py --host <vest-device-ip>
+tools/remote-relay.py             # finds the device automatically
+tools/remote-relay.py --list      # show what's on the LAN
+tools/remote-relay.py --host <ip> # fallback when broadcast can't cross (VLANs)
 ```
 
 VRChat needs no relay: point its OSC output straight at the daemon with the

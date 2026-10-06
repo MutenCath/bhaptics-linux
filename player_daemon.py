@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -433,6 +434,7 @@ AUDIO_CONF = CONFIG_DIR / "audio_settings.json"
 PRESETS_FILE = CONFIG_DIR / "audio_presets.json"
 EFFECTS_FILE = CONFIG_DIR / "effects.json"
 OSC_PORT = 9001  # VRChat sends avatar parameters here
+DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
 
 
@@ -1938,6 +1940,22 @@ def process_request(connection, request):
     return connection.respond(http.HTTPStatus.NOT_FOUND, "not found\n")
 
 
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        parts = data.decode(errors="replace").split()
+        if len(parts) != 3 or parts[0] != "BHAPTICS-LINUX/1" or parts[1] != "DISCOVER":
+            return
+        reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {socket.gethostname()} "
+                 f"15881 15882 {OSC_PORT}")
+        self.transport.sendto(reply.encode(), addr)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     migrate_legacy_state()
@@ -1958,6 +1976,12 @@ async def main():
     if listen_host not in ("127.0.0.1", "::1", "localhost"):
         log.warning("listening on %s: SDK1/SDK2/OSC are unauthenticated — "
                     "trusted networks only (Remote Play), see README", listen_host)
+        try:
+            await loop.create_datagram_endpoint(
+                DiscoveryProtocol, local_addr=("0.0.0.0", DISCOVERY_PORT))
+            log.info("discovery: answering LAN probes on udp://0.0.0.0:%d", DISCOVERY_PORT)
+        except OSError as e:
+            log.warning("discovery port %d unavailable (%s)", DISCOVERY_PORT, e)
 
     try:
         await loop.create_datagram_endpoint(
