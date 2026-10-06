@@ -80,6 +80,12 @@ That creates a venv, installs deps (bleak, websockets, numpy), and sets up a
 to any BLE device named `TactSuit*`/`Tactot*`. Re-run `install.sh` after
 moving the folder. Open the UI, click a grid cell, feel the buzz.
 
+Because it installs a **user** service, run it from a terminal inside your
+graphical login session as your normal user — not over SSH and not with
+`sudo`. (On SteamOS, run it from Desktop Mode; the installer repairs a
+nested-session `XDG_RUNTIME_DIR` automatically.) Note that SteamOS's
+read-only rootfs means the `makepkg` route below won't survive an OS update.
+
 Settings live in `~/.config/bhaptics-linux/` (mapping, presets, effects,
 patterns) and `~/.local/state/bhaptics-linux/` (SDK2 cert + event cache);
 old in-repo state migrates automatically on first start.
