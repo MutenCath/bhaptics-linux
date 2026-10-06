@@ -138,14 +138,19 @@ running on a *different* PC (Steam Remote Play, Steam Link) can't reach it.
 Steam's streaming carries video, audio and controller input, never the game's
 haptics API calls, so native haptics need a bridge. Two pieces:
 
-On the **vest's device**, let the daemon listen on the LAN:
+On the **vest's device**, let the daemon listen on the LAN by setting the bind
+address and restarting it:
 
 ```sh
-BHAPTICS_BIND=0.0.0.0 ./install.sh
-# or write {"bind": "0.0.0.0"} to ~/.config/bhaptics-linux/network.json
+mkdir -p ~/.config/bhaptics-linux
+echo '{"bind": "0.0.0.0"}' > ~/.config/bhaptics-linux/network.json
+systemctl --user restart bhaptics-daemon
 ```
 
-The web UI stays loopback-only regardless. On the **gaming PC**, run the relay
+`BHAPTICS_BIND` in the environment overrides that file for manual runs; to set
+it on the service instead, add `Environment=BHAPTICS_BIND=0.0.0.0` via
+`systemctl --user edit bhaptics-daemon`. The web UI stays loopback-only
+regardless. On the **gaming PC**, run the relay
 so unmodified games still find the Player at 127.0.0.1:
 
 ```sh
