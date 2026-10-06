@@ -837,7 +837,7 @@ function remotePlayMode() {
   const mode = document.getElementById("rpmode").value;
   if (mode === "off") send({RemotePlay: false, RelayHost: false});
   else if (mode === "accept") send({RemotePlay: true, RelayHost: false});
-  else send({RelayHost: true});
+  else send({RemotePlay: false, RelayHost: true});
   toast(mode === "host" ? "hosting haptics…" :
         mode === "accept" ? "accepting haptics on the LAN…" : "remote play off — loopback only");
 }

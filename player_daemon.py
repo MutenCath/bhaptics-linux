@@ -102,9 +102,42 @@ def remote_play_enabled():
     return bind_address() not in ("127.0.0.1", "::1", "localhost")
 
 
-def set_remote_play(enabled):
+def _load_network():
+    try:
+        cfg = json.loads(NETWORK_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _save_network(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    NETWORK_FILE.write_text(json.dumps({"bind": "0.0.0.0" if enabled else "127.0.0.1"}))
+    atomic_write_json(NETWORK_FILE, cfg)
+
+
+def set_remote_play(enabled):
+    cfg = _load_network()
+    cfg["bind"] = "0.0.0.0" if enabled else "127.0.0.1"
+    _save_network(cfg)
+
+
+def relay_host_from_config():
+    return bool(_load_network().get("relay_host"))
+
+
+def set_relay_host(enabled):
+    cfg = _load_network()
+    cfg["relay_host"] = bool(enabled)
+    _save_network(cfg)
+
+
+def _is_local_ip(ip):
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        return True
+    try:
+        return ip in {info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)}
+    except socket.gaierror:
+        return False
 
 
 def _rebind():
@@ -1662,6 +1695,10 @@ class PlayerState:
         self.relay_host = False
         self.host_remote = ""
         self.relay_error = ""
+        self.proxied = set()
+        self._finder = None
+        self._config_failed = False
+        self._bg_tasks = set()
 
     def add_pattern(self, name, project, save=True):
         """Register a pattern under both SDK1 (submit-by-key) and SDK2
@@ -1807,22 +1844,46 @@ class PlayerState:
             }
         )
 
+    def _bg(self, coro):
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def _drop_game_clients(self):
         for ws in list(self.game_clients):
-            with contextlib.suppress(Exception):
-                asyncio.create_task(ws.close())
+            self._bg(ws.close())
 
     def start_relay_host(self):
         if self.relay_host:
             return
         self.relay_host = True
+        self.host_remote = ""
         self.relay_error = ""
-        asyncio.create_task(self._find_vest_host())
+        self._config_failed = False
+        set_relay_host(True)
+        self._restart_finder()
         self._drop_game_clients()
+
+    def _restart_finder(self):
+        if self.relay_host and (self._finder is None or self._finder.done()):
+            self._finder = asyncio.create_task(self._find_vest_host())
 
     async def _find_vest_host(self):
         while self.relay_host and not self.host_remote:
-            remote = remote_host_from_config() or await discover_vest_host()
+            remote = ""
+            try:
+                if not self._config_failed:
+                    remote = remote_host_from_config()
+                    if remote and _is_local_ip(remote):
+                        self.relay_error = "remote is this machine — not forwarding to myself"
+                        remote = ""
+                if not remote:
+                    remote = await discover_vest_host()
+            except Exception as e:
+                self.relay_error = "host discovery failed: %s" % e
+                log.warning("relay host: discovery error: %s", e)
+                remote = ""
             if not self.relay_host:
                 return
             if remote:
@@ -1831,7 +1892,8 @@ class PlayerState:
                 log.info("relay host: forwarding haptics to %s", remote)
                 self._drop_game_clients()
             else:
-                self.relay_error = "no vest device found on the LAN — enable Remote Play there"
+                if not self.relay_error:
+                    self.relay_error = "no vest device found on the LAN — enable Remote Play there"
                 await asyncio.sleep(3)
 
     async def wait_for_remote(self, timeout=4.0):
@@ -1844,19 +1906,40 @@ class PlayerState:
         self.relay_host = False
         self.host_remote = ""
         self.relay_error = ""
+        self._config_failed = False
+        if self._finder is not None and not self._finder.done():
+            self._finder.cancel()
+        for ws in list(self.proxied):
+            self._bg(ws.close())
+        set_relay_host(False)
+
+    def _proxy_failed(self, exc):
+        self.relay_error = str(exc)
+        log.warning("relay host: proxy failed: %s", exc)
+        self.host_remote = ""
+        self._config_failed = True
+        self._restart_finder()
+
+    async def _proxy(self, ws, scheme, port):
+        log.info("relay host: proxying %s://%s:%d%s",
+                 scheme, self.host_remote, port, ws.request.path)
+        uri = "%s://%s:%d%s" % (scheme, self.host_remote, port, ws.request.path)
+        kwargs = {"max_size": 16 * 2**20}
+        if scheme == "wss":
+            kwargs["ssl"] = sdk2_client_ssl_context()
+        self.proxied.add(ws)
+        try:
+            async with websockets.connect(uri, **kwargs) as up:
+                self.relay_error = ""
+                await self._pump(ws, up)
+        finally:
+            self.proxied.discard(ws)
 
     async def proxy_sdk1(self, ws):
-        log.info("relay host: proxying SDK1 %s -> %s", ws.request.path, self.host_remote)
-        uri = "ws://%s:%d%s" % (self.host_remote, SDK1_PORT, ws.request.path)
-        async with websockets.connect(uri, max_size=16 * 2**20) as up:
-            await self._pump(ws, up)
+        await self._proxy(ws, "ws", SDK1_PORT)
 
     async def proxy_sdk2(self, ws):
-        log.info("relay host: proxying SDK2 %s -> %s", ws.request.path, self.host_remote)
-        uri = "wss://%s:%d%s" % (self.host_remote, SDK2_PORT, ws.request.path)
-        async with websockets.connect(uri, ssl=sdk2_client_ssl_context(),
-                                     max_size=16 * 2**20) as up:
-            await self._pump(ws, up)
+        await self._proxy(ws, "wss", SDK2_PORT)
 
     @staticmethod
     async def _pump(a, b):
@@ -1864,8 +1947,8 @@ class PlayerState:
             try:
                 async for msg in src:
                     await dst.send(msg)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("relay host: proxy stream ended: %s", e)
         tasks = [asyncio.create_task(one(a, b)), asyncio.create_task(one(b, a))]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1961,14 +2044,23 @@ class PlayerState:
 
         if "RemotePlay" in payload:
             want = bool(payload["RemotePlay"])
-            if want != remote_play_enabled():
+            if os.environ.get("BHAPTICS_BIND"):
+                self.relay_error = ("BHAPTICS_BIND is set in the environment — "
+                                    "the UI toggle has no effect")
+            elif want != remote_play_enabled():
                 if want:
                     self.stop_relay_host()
                 set_remote_play(want)
                 asyncio.get_running_loop().call_later(0.4, _rebind)
 
         if "RelayHost" in payload:
-            if payload["RelayHost"]:
+            if os.environ.get("BHAPTICS_BIND"):
+                self.relay_error = ("BHAPTICS_BIND is set in the environment — "
+                                    "the UI toggle has no effect")
+            elif payload["RelayHost"]:
+                if remote_play_enabled():
+                    set_remote_play(False)
+                    asyncio.get_running_loop().call_later(0.4, _rebind)
                 self.start_relay_host()
             else:
                 self.stop_relay_host()
@@ -2633,14 +2725,16 @@ async def ws_handler(ws, state):
     # UI/tray/vestctl reconnect constantly (the tray polls every 2 s): debug only
     (log.info if is_game else log.debug)("client connected: %s%s", ws.request.path,
                                          " (game)" if is_game else "")
+    if not is_game and not _is_loopback(getattr(ws, "remote_address", None)):
+        await ws.close(code=1008, reason="UI is local-only")
+        return
     if is_game and state.relay_host:
         await state.wait_for_remote()
         if state.host_remote:
             try:
                 await state.proxy_sdk1(ws)
             except Exception as e:
-                state.relay_error = str(e)
-                log.warning("relay host: SDK1 proxy failed: %s", e)
+                state._proxy_failed(e)
             return
     state.clients.add(ws)
     if is_game:
@@ -2728,8 +2822,7 @@ async def sdk2_handler(ws, state):
             try:
                 await state.proxy_sdk2(ws)
             except Exception as e:
-                state.relay_error = str(e)
-                log.warning("relay host: SDK2 proxy failed: %s", e)
+                state._proxy_failed(e)
             return
     log.info("sdk2 client connected: workspace_id=%r", workspace_id)
     state.game_clients[ws] = f"SDK2: {workspace_id or 'unknown'}"
@@ -2832,10 +2925,7 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
 
 
 def remote_host_from_config():
-    try:
-        return str(json.loads(NETWORK_FILE.read_text()).get("remote") or "")
-    except (OSError, ValueError, TypeError):
-        return ""
+    return str(_load_network().get("remote") or "")
 
 
 async def discover_vest_host(timeout=1.5):
@@ -2880,6 +2970,10 @@ async def main():
     migrate_legacy_state()
     vest = VestLink()
     state = PlayerState(vest)
+    if relay_host_from_config():
+        if remote_play_enabled():
+            set_remote_play(False)
+        state.start_relay_host()
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
