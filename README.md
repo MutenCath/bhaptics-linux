@@ -39,7 +39,10 @@ project does it.
 - **Auto per-game presets** — name a preset exactly like the app in the
   source list (case-insensitive) and it applies itself, bound to that app's
   audio, the moment the game makes sound; your previous setup is restored
-  when the game exits. Toggle in the UI or `vestctl auto on|off`.
+  when the game exits. No preset? Any new app that isn't an obvious
+  non-game (browsers, Discord, media players, SteamVR itself) gets audio
+  mode bound to it automatically with your current settings, so unsupported
+  games just work with zero setup. Toggle in the UI or `vestctl auto on|off`.
 - **Mod patterns** — import `.tact` files, SDK2 definition manifests (the
   JSON Unity/Unreal mods ship), or whole mod folders in the UI or with
   `vestctl import <dir>`; everything is pre-registered at startup under both
