@@ -1939,13 +1939,18 @@ async def main():
         asyncio.create_task(state.autoprofile_loop()),
     ]
 
-    # big max_size: definition manifests and Register payloads can be MBs
+    # big max_size: definition manifests and Register payloads can be MBs.
+    # ping_interval=None: game SDK clients don't answer RFC6455 pings (the
+    # official Player never sends any), so the default 20s ping + 20s timeout
+    # killed every game connection after exactly 40s.
     async with websockets.serve(
         lambda ws: ws_handler(ws, state), "127.0.0.1", 15881,
         process_request=process_request, max_size=16 * 2**20,
+        ping_interval=None,
     ), websockets.serve(
         lambda ws: sdk2_handler(ws, state), "127.0.0.1", 15882,
         ssl=sdk2_ssl_context(), max_size=16 * 2**20,
+        ping_interval=None,
     ):
         log.info("SDK1 on ws://127.0.0.1:15881/v2/feedbacks — UI at http://127.0.0.1:15881/ui")
         log.info("SDK2 on wss://127.0.0.1:15882/v3/feedback")
