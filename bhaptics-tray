@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# System python supplies PyGObject (pystray's AppIndicator backend, needed on
+# Wayland/KDE); the project venv supplies websockets and pystray itself.
+DIR="$(dirname "$(realpath "$0")")"
+SITE=("$DIR"/venv/lib/python3*/site-packages)
+export PYTHONPATH="${SITE[0]}${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 "$DIR/tray.py" "$@"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=bHaptics Vest Tray
+Comment=System-tray status and quick control for the bHaptics vest
+Exec=bhaptics-tray
+Icon=input-gaming
+Terminal=false
+Categories=Game;Settings;

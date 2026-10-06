@@ -48,7 +48,7 @@ async def main():
         await ws.send(json.dumps({"Register": [{"Key": "heartbeat", "Project": HEARTBEAT_PROJECT}]}))
         print("status:", await ws.recv())
 
-        for beat in range(3):
+        for _ in range(3):
             await ws.send(json.dumps({"Submit": [{"Type": "key", "Key": "heartbeat",
                                                   "Parameters": {"intensityRatio": 1.0}}]}))
             await ws.recv()

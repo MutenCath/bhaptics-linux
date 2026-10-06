@@ -429,12 +429,23 @@ def main():
     p.add_argument("-i", "--intensity", type=int, default=60, help="0-100")
     p.add_argument("-d", "--duration", type=int, default=300, help="ms")
     sub.add_parser("stop", help="stop all effects")
+    sub.add_parser("wake", help="reconnect a vest that went to sleep when idle")
     p = sub.add_parser("audio", help="audio mode on/off")
     p.add_argument("state", choices=["on", "off"])
     p = sub.add_parser("auto", help="auto per-game presets on/off")
     p.add_argument("state", choices=["on", "off"])
     p = sub.add_parser("pad", help="gamepad rumble mirror on/off")
     p.add_argument("state", choices=["on", "off"])
+    p = sub.add_parser("feel", help="show/tune how effects turn into motor power")
+    p.add_argument("--strength", type=int, metavar="PCT", help="master strength 25-200 %%")
+    p.add_argument("--floor", type=int, metavar="N", help="minimum motor level 0-6 (0 = off)")
+    p.add_argument("--smooth", choices=["on", "off"], help="dithered finer intensity steps")
+    p.add_argument("--punch", choices=["on", "off"], help="20 ms kick when a motor starts")
+    p.add_argument("--test", action="store_true", help="play the feel test afterwards")
+    p = sub.add_parser("game", help="arm haptics for games (on = any game, off = mute)")
+    p.add_argument("state", nargs="?", choices=["on", "off", "toggle"], default=None)
+    p.add_argument("--forget", action="store_true",
+                   help="clear the per-app settings learned for games")
     p = sub.add_parser("preset", help="list or apply presets")
     p.add_argument("name", nargs="?")
     p = sub.add_parser("effect", help="list or play saved effects")
@@ -481,6 +492,8 @@ def main():
         if args.cmd == "status":
             _, st = await rpc([])
             vest = "connected" if st["ConnectedDeviceCount"] else "NOT FOUND"
+            if not st["ConnectedDeviceCount"] and st.get("VestIdle"):
+                vest = "asleep (vestctl wake, or switch the vest off and on)"
             bat = f" battery {st['Battery']}%" if st.get("Battery") is not None else ""
             audio = "on" if st["AudioMode"] else "off"
             if st.get("AudioSuppressed"):
@@ -492,8 +505,13 @@ def main():
             if st.get("PadDevices"):
                 pad += f" ({', '.join(st['PadDevices'])})"
             print(f"vest: {vest}{bat}")
-            print(f"audio: {audio}  source: {st['AudioSource']}  preset: {st['ActivePreset'] or '-'}")
+            src = st["AudioSource"]
+            if src == "auto":
+                src = "games-only (auto)"
+            print(f"audio: {audio}  source: {src}  preset: {st['ActivePreset'] or '-'}")
             print(f"auto-preset: {auto}  pad-mirror: {pad}")
+            if st.get("LearnedApps"):
+                print(f"learned apps: {', '.join(st['LearnedApps'])}")
             print(f"games: {', '.join(st['GameClients']) or '-'}")
             print(f"effects: {', '.join(st.get('Effects', [])) or '-'}")
             print(f"presets: {', '.join(st.get('Presets', [])) or '-'}")
@@ -514,6 +532,29 @@ def main():
         elif args.cmd == "audio":
             await rpc([{"AudioMode": args.state == "on"}])
             print(f"audio {args.state}")
+        elif args.cmd == "wake":
+            _, st = await rpc([{"Wake": True}])
+            print("waking the vest…" if st.get("VestIdle") or not st["ConnectedDeviceCount"]
+                  else "vest is already awake")
+        elif args.cmd == "feel":
+            change = {}
+            if args.strength is not None:
+                change["strength"] = args.strength / 100
+            if args.floor is not None:
+                change["floor"] = args.floor
+            if args.smooth:
+                change["smooth"] = args.smooth == "on"
+            if args.punch:
+                change["punch"] = args.punch == "on"
+            msgs = ([{"Feel": change}] if change else []) + ([{"FeelTest": True}]
+                                                              if args.test else [])
+            _, st = await rpc(msgs)
+            f = st.get("Feel")
+            if f is None:
+                sys.exit("daemon too old for feel settings — restart it")
+            print(f"strength {round(f['strength'] * 100)}% · minimum level "
+                  f"{f['floor'] or 'off'} · smooth {'on' if f['smooth'] else 'off'}"
+                  f" · punch {'on' if f['punch'] else 'off'}")
         elif args.cmd == "auto":
             await rpc([{"AudioMode": {"auto": args.state == "on"}}])
             print(f"auto per-game presets {args.state}")
@@ -521,6 +562,34 @@ def main():
             _, st = await rpc([{"PadMirror": args.state == "on"}])
             devs = ", ".join(st.get("PadDevices", []))
             print(f"pad mirror {args.state}" + (f" — devices: {devs}" if devs else ""))
+        elif args.cmd == "game":
+            if args.forget:
+                await rpc([{"ForgetLearned": True}])
+                print("cleared per-app learned settings")
+            elif args.state is None:
+                _, st = await rpc([])
+                if not st["AudioMode"]:
+                    print("haptics: off")
+                elif st["AudioSource"] == "auto":
+                    print("haptics: armed for games"
+                          + (f" — active: {st['AutoProfileApp']}"
+                             if st.get("AutoProfileApp") else " (waiting)"))
+                else:
+                    print(f"haptics: on — source {st['AudioSource']}")
+                if st.get("LearnedApps"):
+                    print(f"learned: {', '.join(st['LearnedApps'])}")
+            else:
+                target = args.state
+                if target == "toggle":
+                    _, st = await rpc([])
+                    target = "off" if st["AudioMode"] else "on"
+                if target == "on":
+                    await rpc([{"AudioMode": {"enabled": True, "auto": True,
+                                              "source": "auto"}}])
+                    print("haptics armed — any game that plays sound gets the vest")
+                else:
+                    await rpc([{"AudioMode": False}])
+                    print("haptics off")
         elif args.cmd == "preset":
             if args.name:
                 _, st = await rpc([{"ApplyPreset": args.name}])

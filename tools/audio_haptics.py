@@ -13,7 +13,6 @@ import sys
 import numpy as np
 from bleak import BleakClient
 
-import sys
 if len(sys.argv) < 2 or sys.argv[1].count(":") != 5:
     sys.exit("usage: audio_haptics.py <BLE-MAC-of-vest> [options]")
 ADDR = sys.argv[1]
