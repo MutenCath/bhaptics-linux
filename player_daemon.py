@@ -2,7 +2,10 @@
 
 Listens on ws://127.0.0.1:15881/v2/feedbacks (the endpoint bHaptics-enabled
 games and mods connect to) and drives a TactSuit over BLE, no Windows Player
-needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui.
+needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui (loopback
+only). All sockets bind loopback by default; set BHAPTICS_BIND (or
+~/.config/bhaptics-linux/network.json {"bind": ...}) to expose them on the LAN
+for Remote Play — see tools/remote-relay.py and the README.
 
 Standard protocol: Register (.tact projects), Submit type=key/frame/turnOff/
 turnOffAll, dot+path effects on VestFront/VestBack. Non-vest positions are
@@ -25,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -58,6 +62,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
 MAPPING_FILE = CONFIG_DIR / "mapping.json"
 FEEL_FILE = CONFIG_DIR / "feel.json"
 PATTERNS_DIR = CONFIG_DIR / "patterns"
+NETWORK_FILE = CONFIG_DIR / "network.json"
 
 
 def migrate_legacy_state():
@@ -76,6 +81,21 @@ def migrate_legacy_state():
         if old.exists() and not new.exists():
             shutil.move(str(old), str(new))
             log.info("migrated %s -> %s", old.name, new)
+
+def bind_address():
+    """Address the SDK/OSC sockets listen on, default 127.0.0.1 (matching the
+    official bHaptics Player). Set BHAPTICS_BIND or network.json {"bind": ...}
+    to a LAN address (e.g. 0.0.0.0) to drive the vest from a game running on
+    another PC (Remote Play) via tools/remote-relay.py. These endpoints are
+    unauthenticated, so only bind beyond loopback on a trusted network."""
+    env = os.environ.get("BHAPTICS_BIND")
+    if env:
+        return env
+    try:
+        value = json.loads(NETWORK_FILE.read_text())["bind"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "127.0.0.1"
+    return str(value)
 
 VEST_NAME_PREFIXES = ("TactSuit", "Tactot")
 MOTOR_STABLE = "6e40000a-b5a3-f393-e0a9-e50e24dcca9e"
@@ -668,6 +688,7 @@ AUTOPROFILE_POLL = 4.0  # s between auto-follow scans of playing apps
 SDK1_PORT = 15881  # bHaptics Player SDK1 websocket + web UI (fixed by the SDK)
 SDK2_PORT = 15882  # SDK2 wss (fixed by the SDK)
 OSC_PORT = 9001  # VRChat sends avatar parameters here
+DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
 GAME_ACTIVE_WINDOW = 8.0  # s: while a game sends patterns, audio mode yields
 IDLE_DISCONNECT_SECS = 900  # s: sleep the vest after this long with no haptics
@@ -2625,11 +2646,22 @@ def sdk2_ssl_context():
     return ctx
 
 
+def _is_loopback(addr):
+    if not addr:
+        return False
+    host = addr[0]
+    return host == "::1" or host.startswith("127.")
+
+
 def process_request(connection, request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return None
     path = urlparse(request.path).path
     if path in ("/", "/ui", "/ui.html"):
+        # The control UI shares the SDK1 port; never serve it off-box even when
+        # the SDK endpoints are LAN-bound for Remote Play.
+        if not _is_loopback(connection.remote_address):
+            return connection.respond(http.HTTPStatus.FORBIDDEN, "UI is local-only\n")
         try:
             body = UI_FILE.read_text()
         except OSError:
@@ -2656,6 +2688,22 @@ async def supervise(name, fn):
             await asyncio.sleep(2)
 
 
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        parts = data.decode(errors="replace").split()
+        if len(parts) != 3 or parts[0] != "BHAPTICS-LINUX/1" or parts[1] != "DISCOVER":
+            return
+        reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {socket.gethostname()} "
+                 f"{SDK1_PORT} {SDK2_PORT} {OSC_PORT}")
+        self.transport.sendto(reply.encode(), addr)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # websockets logs every open/close/HTTP request at INFO: journal noise
@@ -2674,10 +2722,21 @@ async def main():
     if state.audio.pad_mirror:
         await state.pad.set_enabled(True)
 
+    listen_host = bind_address()
+    if listen_host not in ("127.0.0.1", "::1", "localhost"):
+        log.warning("listening on %s: SDK1/SDK2/OSC are unauthenticated — "
+                    "trusted networks only (Remote Play), see README", listen_host)
+        try:
+            await loop.create_datagram_endpoint(
+                DiscoveryProtocol, local_addr=("0.0.0.0", DISCOVERY_PORT))
+            log.info("discovery: answering LAN probes on udp://0.0.0.0:%d", DISCOVERY_PORT)
+        except OSError as e:
+            log.warning("discovery port %d unavailable (%s)", DISCOVERY_PORT, e)
+
     try:
         await loop.create_datagram_endpoint(
-            lambda: OscProtocol(state), local_addr=("127.0.0.1", OSC_PORT))
-        log.info("OSC (VRChat) listening on udp://127.0.0.1:%d", OSC_PORT)
+            lambda: OscProtocol(state), local_addr=(listen_host, OSC_PORT))
+        log.info("OSC (VRChat) listening on udp://%s:%d", listen_host, OSC_PORT)
     except OSError as e:
         log.warning("OSC port %d unavailable (%s) — VRChat bridge disabled", OSC_PORT, e)
 
@@ -2694,17 +2753,17 @@ async def main():
     # official Player never sends any), so the default 20s ping + 20s timeout
     # killed every game connection after exactly 40s.
     async with websockets.serve(
-        lambda ws: ws_handler(ws, state), "127.0.0.1", SDK1_PORT,
+        lambda ws: ws_handler(ws, state), listen_host, SDK1_PORT,
         process_request=process_request, max_size=16 * 2**20,
         ping_interval=None,
     ), websockets.serve(
-        lambda ws: sdk2_handler(ws, state), "127.0.0.1", SDK2_PORT,
+        lambda ws: sdk2_handler(ws, state), listen_host, SDK2_PORT,
         ssl=sdk2_ssl_context(), max_size=16 * 2**20,
         ping_interval=None,
     ):
-        log.info("SDK1 on ws://127.0.0.1:%d/v2/feedbacks — UI at http://127.0.0.1:%d/ui",
-                 SDK1_PORT, SDK1_PORT)
-        log.info("SDK2 on wss://127.0.0.1:%d/v3/feedback", SDK2_PORT)
+        log.info("SDK1 on ws://%s:%d/v2/feedbacks — local UI at http://127.0.0.1:%d/ui",
+                 listen_host, SDK1_PORT, SDK1_PORT)
+        log.info("SDK2 on wss://%s:%d/v3/feedback", listen_host, SDK2_PORT)
         await stop.wait()
 
     await state.audio.set_enabled(False)
