@@ -131,6 +131,36 @@ taps. The plugin source lives in `plugin/VestRumble/` (~200 lines, builds
 with `dotnet build`); tune strength per game in
 `BepInEx/config/org.bhaptics-linux.vestrumble.cfg`.
 
+## Remote Play (game on another PC)
+
+The daemon binds loopback only — matching the official Player — so a game
+running on a *different* PC (Steam Remote Play, Steam Link) can't reach it.
+Steam's streaming carries video, audio and controller input, never the game's
+haptics API calls, so native haptics need a bridge. Two pieces:
+
+On the **vest's device**, let the daemon listen on the LAN:
+
+```sh
+BHAPTICS_BIND=0.0.0.0 ./install.sh
+# or write {"bind": "0.0.0.0"} to ~/.config/bhaptics-linux/network.json
+```
+
+The web UI stays loopback-only regardless. On the **gaming PC**, run the relay
+so unmodified games still find the Player at 127.0.0.1:
+
+```sh
+tools/remote-relay.py --host <vest-device-ip>
+```
+
+VRChat needs no relay: point its OSC output straight at the daemon with the
+launch option `--osc=9000:<vest-device-ip>:9001`.
+
+The SDK and OSC endpoints are **unauthenticated** (as is the official Player),
+so bind beyond loopback only on a trusted network and firewall the ports if in
+doubt. Bridged haptics also arrive slightly *before* the streamed video (the
+video is still buffered), so they can feel early — audio mode stays in sync
+because it taps the already-delayed audio.
+
 ## Vibecoded, and proud of it
 
 This project was built in one long session with

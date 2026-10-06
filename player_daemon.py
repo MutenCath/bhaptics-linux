@@ -2,7 +2,10 @@
 
 Listens on ws://127.0.0.1:15881/v2/feedbacks (the endpoint bHaptics-enabled
 games and mods connect to) and drives a TactSuit over BLE, no Windows Player
-needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui.
+needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui (loopback
+only). All sockets bind loopback by default; set BHAPTICS_BIND (or
+~/.config/bhaptics-linux/network.json {"bind": ...}) to expose them on the LAN
+for Remote Play — see tools/remote-relay.py and the README.
 
 Standard protocol: Register (.tact projects), Submit type=key/frame/turnOff/
 turnOffAll, dot+path effects on VestFront/VestBack. Non-vest positions are
@@ -54,6 +57,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 Path.home() / ".local/state")) / "bhaptics-linux"
 MAPPING_FILE = CONFIG_DIR / "mapping.json"
 PATTERNS_DIR = CONFIG_DIR / "patterns"
+NETWORK_FILE = CONFIG_DIR / "network.json"
 
 
 def migrate_legacy_state():
@@ -72,6 +76,21 @@ def migrate_legacy_state():
         if old.exists() and not new.exists():
             shutil.move(str(old), str(new))
             log.info("migrated %s -> %s", old.name, new)
+
+def bind_address():
+    """Address the SDK/OSC sockets listen on, default 127.0.0.1 (matching the
+    official bHaptics Player). Set BHAPTICS_BIND or network.json {"bind": ...}
+    to a LAN address (e.g. 0.0.0.0) to drive the vest from a game running on
+    another PC (Remote Play) via tools/remote-relay.py. These endpoints are
+    unauthenticated, so only bind beyond loopback on a trusted network."""
+    env = os.environ.get("BHAPTICS_BIND")
+    if env:
+        return env
+    try:
+        value = json.loads(NETWORK_FILE.read_text())["bind"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "127.0.0.1"
+    return str(value)
 
 VEST_NAME_PREFIXES = ("TactSuit", "Tactot")
 MOTOR_STABLE = "6e40000a-b5a3-f393-e0a9-e50e24dcca9e"
@@ -1891,11 +1910,22 @@ def sdk2_ssl_context():
     return ctx
 
 
+def _is_loopback(addr):
+    if not addr:
+        return False
+    host = addr[0]
+    return host == "::1" or host.startswith("127.")
+
+
 def process_request(connection, request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return None
     path = urlparse(request.path).path
     if path in ("/", "/ui", "/ui.html"):
+        # The control UI shares the SDK1 port; never serve it off-box even when
+        # the SDK endpoints are LAN-bound for Remote Play.
+        if not _is_loopback(connection.remote_address):
+            return connection.respond(http.HTTPStatus.FORBIDDEN, "UI is local-only\n")
         try:
             body = UI_FILE.read_text()
         except OSError:
@@ -1924,10 +1954,15 @@ async def main():
     if state.audio.pad_mirror:
         await state.pad.set_enabled(True)
 
+    listen_host = bind_address()
+    if listen_host not in ("127.0.0.1", "::1", "localhost"):
+        log.warning("listening on %s: SDK1/SDK2/OSC are unauthenticated — "
+                    "trusted networks only (Remote Play), see README", listen_host)
+
     try:
         await loop.create_datagram_endpoint(
-            lambda: OscProtocol(state), local_addr=("127.0.0.1", OSC_PORT))
-        log.info("OSC (VRChat) listening on udp://127.0.0.1:%d", OSC_PORT)
+            lambda: OscProtocol(state), local_addr=(listen_host, OSC_PORT))
+        log.info("OSC (VRChat) listening on udp://%s:%d", listen_host, OSC_PORT)
     except OSError as e:
         log.warning("OSC port %d unavailable (%s) — VRChat bridge disabled", OSC_PORT, e)
 
@@ -1941,14 +1976,15 @@ async def main():
 
     # big max_size: definition manifests and Register payloads can be MBs
     async with websockets.serve(
-        lambda ws: ws_handler(ws, state), "127.0.0.1", 15881,
+        lambda ws: ws_handler(ws, state), listen_host, 15881,
         process_request=process_request, max_size=16 * 2**20,
     ), websockets.serve(
-        lambda ws: sdk2_handler(ws, state), "127.0.0.1", 15882,
+        lambda ws: sdk2_handler(ws, state), listen_host, 15882,
         ssl=sdk2_ssl_context(), max_size=16 * 2**20,
     ):
-        log.info("SDK1 on ws://127.0.0.1:15881/v2/feedbacks — UI at http://127.0.0.1:15881/ui")
-        log.info("SDK2 on wss://127.0.0.1:15882/v3/feedback")
+        log.info("SDK1 on ws://%s:15881/v2/feedbacks — local UI at http://127.0.0.1:15881/ui",
+                 listen_host)
+        log.info("SDK2 on wss://%s:15882/v3/feedback", listen_host)
         await stop.wait()
 
     await state.audio.set_enabled(False)
