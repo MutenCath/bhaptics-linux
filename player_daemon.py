@@ -533,8 +533,15 @@ def parse_osc(data):
 class OscProtocol(asyncio.DatagramProtocol):
     def __init__(self, state):
         self.state = state
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data, addr):
+        if self.state.relay_host and self.state.host_remote:
+            with contextlib.suppress(Exception):
+                self.transport.sendto(data, (self.state.host_remote, OSC_PORT))
         for address, args in parse_osc(data):
             if address == "/vest/tap":
                 # generic-profile rumble (VestRumble plugin / scripts);
@@ -1652,7 +1659,8 @@ class PlayerState:
         self.import_note = ""
         self._load_sdk2_cache()
         self._load_patterns()  # after cache: explicit imports win over cache
-        self.relay_proc = None
+        self.relay_host = False
+        self.host_remote = ""
         self.relay_error = ""
 
     def add_pattern(self, name, project, save=True):
@@ -1762,7 +1770,8 @@ class PlayerState:
                 "ConnectedPositions": ["Vest"] if self.vest.connected else [],
                 "VestIdle": bool(self.vest.idle),
                 "RemotePlay": remote_play_enabled(),
-                "RelayHost": self.relay_host_active(),
+                "RelayHost": self.relay_host,
+                "RelayHostRemote": self.host_remote,
                 "RelayHostError": self.relay_error,
                 "Mapping": self.mapping.as_dict(),
                 "Feel": self.feel.as_dict(),
@@ -1798,37 +1807,51 @@ class PlayerState:
             }
         )
 
-    def relay_host_active(self):
-        return self.relay_proc is not None and self.relay_proc.poll() is None
-
     def start_relay_host(self):
-        if self.relay_host_active():
+        if self.relay_host:
             return
+        self.relay_host = True
         self.relay_error = ""
-        relay = BASE_DIR / "tools" / "remote-relay.py"
-        self.relay_proc = subprocess.Popen(
-            [sys.executable, str(relay)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        asyncio.create_task(self._watch_relay())
+        asyncio.create_task(self._find_vest_host())
 
-    async def _watch_relay(self):
-        proc = self.relay_proc
-        await asyncio.sleep(2.0)
-        if proc is not None and proc.poll() is not None and self.relay_proc is proc:
-            out = ""
-            with contextlib.suppress(Exception):
-                out = proc.stdout.read() or ""
-            lines = [ln for ln in out.splitlines() if ln.strip()]
-            self.relay_error = lines[-1] if lines else "relay exited"
-            log.warning("relay host failed: %s", self.relay_error)
-            self.relay_proc = None
+    async def _find_vest_host(self):
+        while self.relay_host and not self.host_remote:
+            remote = remote_host_from_config() or await discover_vest_host()
+            if not self.relay_host:
+                return
+            if remote:
+                self.host_remote = remote
+                self.relay_error = ""
+                log.info("relay host: forwarding haptics to %s", remote)
+            else:
+                self.relay_error = "no vest device found on the LAN — enable Remote Play there"
+                await asyncio.sleep(3)
 
     def stop_relay_host(self):
-        if self.relay_proc is not None:
-            with contextlib.suppress(Exception):
-                self.relay_proc.terminate()
-        self.relay_proc = None
+        self.relay_host = False
+        self.host_remote = ""
         self.relay_error = ""
+
+    async def proxy_sdk1(self, ws):
+        uri = "ws://%s:%d%s" % (self.host_remote, SDK1_PORT, ws.request.path)
+        async with websockets.connect(uri, max_size=16 * 2**20) as up:
+            await self._pump(ws, up)
+
+    async def proxy_sdk2(self, ws):
+        uri = "wss://%s:%d%s" % (self.host_remote, SDK2_PORT, ws.request.path)
+        async with websockets.connect(uri, ssl=sdk2_client_ssl_context(),
+                                     max_size=16 * 2**20) as up:
+            await self._pump(ws, up)
+
+    @staticmethod
+    async def _pump(a, b):
+        async def one(src, dst):
+            try:
+                async for msg in src:
+                    await dst.send(msg)
+            except Exception:
+                pass
+        await asyncio.gather(one(a, b), one(b, a))
 
     async def handle(self, payload, game=False):
         for reg in payload.get("Register") or []:
@@ -2589,6 +2612,12 @@ async def ws_handler(ws, state):
     # UI/tray/vestctl reconnect constantly (the tray polls every 2 s): debug only
     (log.info if is_game else log.debug)("client connected: %s%s", ws.request.path,
                                          " (game)" if is_game else "")
+    if is_game and state.relay_host and state.host_remote:
+        try:
+            await state.proxy_sdk1(ws)
+        except Exception as e:
+            state.relay_error = str(e)
+        return
     state.clients.add(ws)
     if is_game:
         state.game_clients[ws] = app_name or app_id or "unnamed client"
@@ -2669,6 +2698,12 @@ async def sdk2_handler(ws, state):
     q = parse_qs(urlparse(ws.request.path).query)
     workspace_id = (q.get("workspace_id") or [""])[0]
     api_key = (q.get("api_key") or [""])[0]
+    if state.relay_host and state.host_remote:
+        try:
+            await state.proxy_sdk2(ws)
+        except Exception as e:
+            state.relay_error = str(e)
+        return
     log.info("sdk2 client connected: workspace_id=%r", workspace_id)
     state.game_clients[ws] = f"SDK2: {workspace_id or 'unknown'}"
     state.vest.mark_active()  # a game is here: wake the vest if it slept
@@ -2767,6 +2802,48 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {socket.gethostname()} "
                  f"{SDK1_PORT} {SDK2_PORT} {OSC_PORT}")
         self.transport.sendto(reply.encode(), addr)
+
+
+def remote_host_from_config():
+    try:
+        return str(json.loads(NETWORK_FILE.read_text()).get("remote") or "")
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+async def discover_vest_host(timeout=1.5):
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", 0))
+    nonce = os.urandom(8).hex()
+    found = []
+
+    class Probe(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            parts = data.decode(errors="replace").split()
+            if (len(parts) == 7 and parts[0] == "BHAPTICS-LINUX/1" and parts[1] == "OFFER"
+                    and parts[2] == nonce and parts[3] != socket.gethostname()
+                    and addr[0] not in ("127.0.0.1", "::1")):
+                found.append(addr[0])
+
+    transport, _ = await loop.create_datagram_endpoint(Probe, sock=sock)
+    with contextlib.suppress(OSError):
+        transport.sendto(f"BHAPTICS-LINUX/1 DISCOVER {nonce}".encode(),
+                         ("255.255.255.255", DISCOVERY_PORT))
+    await asyncio.sleep(timeout)
+    transport.close()
+    return found[0] if found else None
+
+
+def sdk2_client_ssl_context():
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 async def main():

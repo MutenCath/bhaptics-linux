@@ -1,4 +1,5 @@
-"""Remote Play toggle: the persisted LAN-bind setting behind the UI switch."""
+"""Remote Play toggle: the persisted LAN-bind setting and the host forwarder."""
+import json
 from unittest import mock
 
 import player_daemon as pd
@@ -32,17 +33,30 @@ class RemotePlayTest(IsolatedTestCase):
 class RelayHostTest(IsolatedTestCase):
     def test_default_inactive(self):
         st = pd.PlayerState(FakeVest())
-        self.assertFalse(st.relay_host_active())
+        self.assertFalse(st.relay_host)
+        self.assertEqual(st.host_remote, "")
         self.assertEqual(st.relay_error, "")
 
-    def test_stop_is_noop_when_not_running(self):
+    def test_stop_clears_state(self):
         st = pd.PlayerState(FakeVest())
-        st.stop_relay_host()
-        self.assertFalse(st.relay_host_active())
-        self.assertEqual(st.relay_error, "")
-
-    def test_stopping_clears_previous_error(self):
-        st = pd.PlayerState(FakeVest())
+        st.relay_host = True
+        st.host_remote = "10.0.0.5"
         st.relay_error = "boom"
         st.stop_relay_host()
+        self.assertFalse(st.relay_host)
+        self.assertEqual(st.host_remote, "")
         self.assertEqual(st.relay_error, "")
+
+    def test_status_exposes_relay_keys(self):
+        st = pd.PlayerState(FakeVest())
+        msg = json.loads(st.status_message())
+        self.assertIn("RelayHost", msg)
+        self.assertIn("RelayHostRemote", msg)
+        self.assertIn("RelayHostError", msg)
+
+    def test_remote_host_from_config(self):
+        pd.NETWORK_FILE.write_text('{"remote": "10.0.0.7"}')
+        self.assertEqual(pd.remote_host_from_config(), "10.0.0.7")
+
+    def test_remote_host_missing(self):
+        self.assertEqual(pd.remote_host_from_config(), "")
