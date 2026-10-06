@@ -2,7 +2,7 @@
 # (alternative to ./install.sh; disable the user unit from install.sh first:
 #  systemctl --user disable --now bhaptics-daemon)
 pkgname=bhaptics-linux
-pkgver=0.0.1
+pkgver=0.0.2
 pkgrel=1
 pkgdesc="bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio -> BLE, no Windows Player"
 arch=(any)

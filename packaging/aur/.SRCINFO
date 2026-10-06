@@ -1,6 +1,6 @@
 pkgbase = bhaptics-linux-git
 	pkgdesc = bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio-to-haptics over BLE, no Windows Player needed
-	pkgver = 0.0.1.r0.g0000000
+	pkgver = 0.0.2.r0.g0000000
 	pkgrel = 1
 	url = https://github.com/MutenCath/bhaptics-linux
 	arch = any

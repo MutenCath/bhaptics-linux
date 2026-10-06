@@ -18,7 +18,7 @@ class IsolatedTestCase(unittest.TestCase):
 
     NAMES = ("CONFIG_DIR", "STATE_DIR", "MAPPING_FILE", "PATTERNS_DIR",
              "AUDIO_CONF", "PRESETS_FILE", "LEARNED_FILE", "EFFECTS_FILE",
-             "MIGRATED_MARK", "SDK2_CACHE", "FEEL_FILE")
+             "MIGRATED_MARK", "SDK2_CACHE", "FEEL_FILE", "NETWORK_FILE")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="bhaptics-test-"))
@@ -34,6 +34,7 @@ class IsolatedTestCase(unittest.TestCase):
         pd.MIGRATED_MARK = self.tmp / ".games-only-default"
         pd.SDK2_CACHE = self.tmp / "sdk2_cache"
         pd.FEEL_FILE = self.tmp / "feel.json"
+        pd.NETWORK_FILE = self.tmp / "network.json"
 
     def tearDown(self):
         for name, value in self._orig.items():

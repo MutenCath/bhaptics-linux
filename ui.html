@@ -522,6 +522,16 @@
           <span class="hint" id="learnedinfo" style="margin:0"></span>
         </div>
       </div>
+
+      <div class="group">
+        <h3>Remote Play</h3>
+        <label class="tog"><span class="switch"><input type="checkbox" id="remoteplay" onchange="remotePlaySend()"><i></i></span>
+          accept haptics from another PC</label>
+        <div class="hint" style="margin:8px 0 0">bind the Player on this device's LAN so a game
+          running on another PC (Steam Remote Play) can reach it — run
+          <code>tools/remote-relay.py</code> there and it finds this device automatically.
+          Turning it off returns to loopback-only; applies after a quick restart.</div>
+      </div>
     </div>
   </div>
 </section>
@@ -687,6 +697,7 @@ function connect() {
     if ("AudioAuto" in msg) document.getElementById("autoprof").checked = !!msg.AudioAuto;
     if ("AudioNotify" in msg) document.getElementById("notify").checked = !!msg.AudioNotify;
     if ("PadMirror" in msg) document.getElementById("padmir").checked = !!msg.PadMirror;
+    if ("RemotePlay" in msg) document.getElementById("remoteplay").checked = !!msg.RemotePlay;
     document.getElementById("padinfo").textContent =
       (msg.PadDevices || []).length ? "🎮 " + msg.PadDevices.join(", ") : "";
     document.getElementById("autoinfo").textContent =
@@ -811,6 +822,12 @@ function fireRaw(motor, dur) {
   send({Submit: [{Type: "raw", Key: "ui-raw", Frame: {Motors: motors, DurationMillis: dur || duration()}}]});
 }
 function turnOffAll() { send({Submit: [{Type: "turnOffAll"}]}); }
+function remotePlaySend() {
+  const on = document.getElementById("remoteplay").checked;
+  send({RemotePlay: on});
+  toast(on ? "remote play on — re-binding on the LAN…" : "remote play off — back to loopback…");
+}
+
 function audioSend() {
   send({AudioMode: {enabled: document.getElementById("audio").checked,
                     stereo: document.getElementById("stereo").checked,

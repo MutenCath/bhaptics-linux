@@ -49,7 +49,7 @@ except ImportError:  # pad mirror simply stays unavailable
 
 log = logging.getLogger("bhaptics-daemon")
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_FILE = BASE_DIR / "ui.html"
@@ -96,6 +96,20 @@ def bind_address():
     except (OSError, ValueError, KeyError, TypeError):
         return "127.0.0.1"
     return str(value)
+
+
+def remote_play_enabled():
+    return bind_address() not in ("127.0.0.1", "::1", "localhost")
+
+
+def set_remote_play(enabled):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    NETWORK_FILE.write_text(json.dumps({"bind": "0.0.0.0" if enabled else "127.0.0.1"}))
+
+
+def _rebind():
+    log.info("re-binding listeners (remote play)")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 VEST_NAME_PREFIXES = ("TactSuit", "Tactot")
 MOTOR_STABLE = "6e40000a-b5a3-f393-e0a9-e50e24dcca9e"
@@ -1745,6 +1759,7 @@ class PlayerState:
                 "ConnectedDeviceCount": 1 if self.vest.connected else 0,
                 "ConnectedPositions": ["Vest"] if self.vest.connected else [],
                 "VestIdle": bool(self.vest.idle),
+                "RemotePlay": remote_play_enabled(),
                 "Mapping": self.mapping.as_dict(),
                 "Feel": self.feel.as_dict(),
                 "AudioMode": self.audio.enabled,
@@ -1863,6 +1878,12 @@ class PlayerState:
         if "PadMirror" in payload:
             self.audio.pad_mirror = bool(payload["PadMirror"])
             await self.pad.set_enabled(self.audio.pad_mirror)
+
+        if "RemotePlay" in payload:
+            want = bool(payload["RemotePlay"])
+            if want != remote_play_enabled():
+                set_remote_play(want)
+                asyncio.get_running_loop().call_later(0.4, _rebind)
 
         if (payload.get("SurroundTest")
                 and (self._surtest is None or self._surtest.done())):
