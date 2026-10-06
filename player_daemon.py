@@ -1652,6 +1652,8 @@ class PlayerState:
         self.import_note = ""
         self._load_sdk2_cache()
         self._load_patterns()  # after cache: explicit imports win over cache
+        self.relay_proc = None
+        self.relay_error = ""
 
     def add_pattern(self, name, project, save=True):
         """Register a pattern under both SDK1 (submit-by-key) and SDK2
@@ -1760,6 +1762,8 @@ class PlayerState:
                 "ConnectedPositions": ["Vest"] if self.vest.connected else [],
                 "VestIdle": bool(self.vest.idle),
                 "RemotePlay": remote_play_enabled(),
+                "RelayHost": self.relay_host_active(),
+                "RelayHostError": self.relay_error,
                 "Mapping": self.mapping.as_dict(),
                 "Feel": self.feel.as_dict(),
                 "AudioMode": self.audio.enabled,
@@ -1793,6 +1797,38 @@ class PlayerState:
                 "Version": __version__,
             }
         )
+
+    def relay_host_active(self):
+        return self.relay_proc is not None and self.relay_proc.poll() is None
+
+    def start_relay_host(self):
+        if self.relay_host_active():
+            return
+        self.relay_error = ""
+        relay = BASE_DIR / "tools" / "remote-relay.py"
+        self.relay_proc = subprocess.Popen(
+            [sys.executable, str(relay)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        asyncio.create_task(self._watch_relay())
+
+    async def _watch_relay(self):
+        proc = self.relay_proc
+        await asyncio.sleep(2.0)
+        if proc is not None and proc.poll() is not None and self.relay_proc is proc:
+            out = ""
+            with contextlib.suppress(Exception):
+                out = proc.stdout.read() or ""
+            lines = [ln for ln in out.splitlines() if ln.strip()]
+            self.relay_error = lines[-1] if lines else "relay exited"
+            log.warning("relay host failed: %s", self.relay_error)
+            self.relay_proc = None
+
+    def stop_relay_host(self):
+        if self.relay_proc is not None:
+            with contextlib.suppress(Exception):
+                self.relay_proc.terminate()
+        self.relay_proc = None
+        self.relay_error = ""
 
     async def handle(self, payload, game=False):
         for reg in payload.get("Register") or []:
@@ -1882,8 +1918,16 @@ class PlayerState:
         if "RemotePlay" in payload:
             want = bool(payload["RemotePlay"])
             if want != remote_play_enabled():
+                if want:
+                    self.stop_relay_host()
                 set_remote_play(want)
                 asyncio.get_running_loop().call_later(0.4, _rebind)
+
+        if "RelayHost" in payload:
+            if payload["RelayHost"]:
+                self.start_relay_host()
+            else:
+                self.stop_relay_host()
 
         if (payload.get("SurroundTest")
                 and (self._surtest is None or self._surtest.done())):
@@ -2788,6 +2832,7 @@ async def main():
         await stop.wait()
 
     await state.audio.set_enabled(False)
+    state.stop_relay_host()
     for task in tasks:
         task.cancel()
     if vest.connected:
