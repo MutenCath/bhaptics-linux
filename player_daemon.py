@@ -2,7 +2,10 @@
 
 Listens on ws://127.0.0.1:15881/v2/feedbacks (the endpoint bHaptics-enabled
 games and mods connect to) and drives a TactSuit over BLE, no Windows Player
-needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui.
+needed. Also serves a test/mapping UI at http://127.0.0.1:15881/ui (loopback
+only). All sockets bind loopback by default; set BHAPTICS_BIND (or
+~/.config/bhaptics-linux/network.json {"bind": ...}) to expose them on the LAN
+for Remote Play — see tools/remote-relay.py and the README.
 
 Standard protocol: Register (.tact projects), Submit type=key/frame/turnOff/
 turnOffAll, dot+path effects on VestFront/VestBack. Non-vest positions are
@@ -15,7 +18,9 @@ Extensions (used by the UI, ignored by real SDK clients):
 Status replies additionally carry "Mapping" and "AudioMode".
 """
 import asyncio
+import base64
 import contextlib
+import errno
 import http
 import json
 import logging
@@ -23,9 +28,11 @@ import os
 import re
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -42,7 +49,7 @@ except ImportError:  # pad mirror simply stays unavailable
 
 log = logging.getLogger("bhaptics-daemon")
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_FILE = BASE_DIR / "ui.html"
@@ -53,7 +60,9 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 Path.home() / ".local/state")) / "bhaptics-linux"
 MAPPING_FILE = CONFIG_DIR / "mapping.json"
+FEEL_FILE = CONFIG_DIR / "feel.json"
 PATTERNS_DIR = CONFIG_DIR / "patterns"
+NETWORK_FILE = CONFIG_DIR / "network.json"
 
 
 def migrate_legacy_state():
@@ -72,6 +81,35 @@ def migrate_legacy_state():
         if old.exists() and not new.exists():
             shutil.move(str(old), str(new))
             log.info("migrated %s -> %s", old.name, new)
+
+def bind_address():
+    """Address the SDK/OSC sockets listen on, default 127.0.0.1 (matching the
+    official bHaptics Player). Set BHAPTICS_BIND or network.json {"bind": ...}
+    to a LAN address (e.g. 0.0.0.0) to drive the vest from a game running on
+    another PC (Remote Play) via tools/remote-relay.py. These endpoints are
+    unauthenticated, so only bind beyond loopback on a trusted network."""
+    env = os.environ.get("BHAPTICS_BIND")
+    if env:
+        return env
+    try:
+        value = json.loads(NETWORK_FILE.read_text())["bind"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "127.0.0.1"
+    return str(value)
+
+
+def remote_play_enabled():
+    return bind_address() not in ("127.0.0.1", "::1", "localhost")
+
+
+def set_remote_play(enabled):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    NETWORK_FILE.write_text(json.dumps({"bind": "0.0.0.0" if enabled else "127.0.0.1"}))
+
+
+def _rebind():
+    log.info("re-binding listeners (remote play)")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 VEST_NAME_PREFIXES = ("TactSuit", "Tactot")
 MOTOR_STABLE = "6e40000a-b5a3-f393-e0a9-e50e24dcca9e"
@@ -97,6 +135,49 @@ def grid_to_dot(x, y):
     return row * 4 + col
 
 
+PATH_RADIUS = 0.3  # falloff distance (grid units; motors are 0.25 x 0.2 apart)
+
+
+def spread_point(target, x, y, intensity, motor_count=3):
+    """Render a path point the way the Player does: a soft spot over the
+    nearest motors (intensity falling off with distance) instead of snapping
+    to one motor — so moving paths glide instead of jumping cell to cell."""
+    x = min(1.0, max(0.0, x))
+    y = min(1.0, max(0.0, y))
+    near = sorted(
+        (((c + 0.5) / 4 - x) ** 2 + ((r + 0.5) / 5 - y) ** 2, r * 4 + c)
+        for r in range(5) for c in range(4))[:max(1, int(motor_count or 3))]
+    weights = [(max(0.0, 1.0 - d2 ** 0.5 / PATH_RADIUS), i) for d2, i in near]
+    # every point is < 0.17 from a motor centre, so the closest weight is > 0;
+    # scaling by it gives the closest motor(s) the full intensity
+    top = weights[0][0]
+    for w, i in weights:
+        target[i] = max(target[i], intensity * w / top)
+
+
+def path_at(pts, rel):
+    """Position/intensity of a path at `rel` ms, interpolated between the
+    surrounding keyframes."""
+    prev = pts[0]
+    for p in pts:
+        t = int(g(p, "Time", 0))
+        if t > rel:
+            t0 = int(g(prev, "Time", 0))
+            if t <= t0:
+                break
+            k = (rel - t0) / (t - t0)
+            # normalise before blending: 0..100 ints near 0 would otherwise
+            # read as 0..1 floats mid-way
+            a = (float(g(prev, "X", 0)), float(g(prev, "Y", 0)),
+                 norm_intensity(g(prev, "Intensity", 0)))
+            b = (float(g(p, "X", 0)), float(g(p, "Y", 0)),
+                 norm_intensity(g(p, "Intensity", 0)))
+            return tuple(u + (v - u) * k for u, v in zip(a, b))
+        prev = p
+    return (float(g(prev, "X", 0)), float(g(prev, "Y", 0)),
+            norm_intensity(g(prev, "Intensity", 0)))
+
+
 def norm_intensity(v):
     """tact files use 0..1 floats; frame submits use 0..100 ints."""
     v = float(v)
@@ -109,6 +190,66 @@ def g(d, key, default=None):
         return d[key]
     alt = key[0].lower() + key[1:]
     return d.get(alt, default)
+
+
+class Feel:
+    """Output stage: turns 0..1 motor levels into the vest's 4-bit values.
+
+    - strength: master intensity for everything the vest plays
+    - floor: lowest level a motor is driven at when it should be on at all
+      (coin motors don't start below a few steps, so weak effects vanished)
+    - smooth: error-diffusion dithering across 20 ms ticks, so the motors'
+      inertia averages neighbouring steps into ~4x finer intensity
+    - punch: one full-power tick when a motor starts from rest, spinning
+      the motor up faster so taps land crisp instead of mushy
+    """
+
+    DEFAULTS = {"strength": 1.0, "floor": 0, "smooth": True, "punch": False}
+
+    def __init__(self):
+        self.strength = 1.0
+        self.floor = 0
+        self.smooth = True
+        self.punch = False
+        self._err = [0.0] * 40
+        self._prev = [0] * 40
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            self.update(json.loads(FEEL_FILE.read_text()), save=False)
+
+    def as_dict(self):
+        return {"strength": self.strength, "floor": self.floor,
+                "smooth": self.smooth, "punch": self.punch}
+
+    def update(self, d, save=True):
+        self.strength = min(2.0, max(0.25, float(d.get("strength", self.strength))))
+        self.floor = min(6, max(0, int(d.get("floor", self.floor))))
+        self.smooth = bool(d.get("smooth", self.smooth))
+        self.punch = bool(d.get("punch", self.punch))
+        if save:
+            with contextlib.suppress(OSError):
+                atomic_write_json(FEEL_FILE, self.as_dict())
+
+    def shape(self, levels):
+        """levels: 40 floats 0..1 (physical motor order) -> 40 ints 0..15."""
+        out = [0] * 40
+        span = 15 - self.floor
+        for i, v in enumerate(levels):
+            if v <= 0.004:  # off stays exactly off (no dither noise)
+                self._err[i] = 0.0
+                self._prev[i] = 0
+                continue
+            want = self.floor + min(1.0, v * self.strength) * span
+            if self.smooth:
+                want += self._err[i]
+                q = min(15, max(1 if self.floor else 0, int(want + 0.5)))
+                self._err[i] = max(-1.0, min(1.0, want - q))
+            else:
+                q = min(15, max(1 if self.floor else 0, round(want)))
+            if self.punch and q and not self._prev[i]:
+                q = 15  # kick-start from rest; next tick settles to the level
+            out[i] = q
+            self._prev[i] = q
+        return out
 
 
 class VestMapping:
@@ -130,7 +271,7 @@ class VestMapping:
             raise ValueError("mapping must be two lists of 20 motor indices in 0-39")
         self.front, self.back = front, back
         if save:
-            MAPPING_FILE.write_text(json.dumps({"front": front, "back": back}))
+            atomic_write_json(MAPPING_FILE, {"front": front, "back": back})
             log.info("mapping saved")
 
     def as_dict(self):
@@ -165,8 +306,8 @@ def compile_frame_submit(frame_msg):
             if 0 <= i < 20:
                 target[i] = max(target[i], norm_intensity(d.get("Intensity", 0)))
         for p in paths or []:
-            i = grid_to_dot(float(p.get("X", 0)), float(p.get("Y", 0)))
-            target[i] = max(target[i], norm_intensity(p.get("Intensity", 0)))
+            spread_point(target, float(p.get("X", 0)), float(p.get("Y", 0)),
+                         norm_intensity(p.get("Intensity", 0)), p.get("MotorCount", 3))
 
     dots, paths = frame_msg.get("DotPoints"), frame_msg.get("PathPoints")
     if position in ("VestFront", "Vest"):
@@ -243,19 +384,103 @@ def compile_project(project, intensity_ratio=1.0, duration_ratio=1.0):
                 for i, inten in payload:
                     if 0 <= i < 20:
                         target[i] = max(target[i], inten * intensity_ratio)
-            else:  # path: step through the point list by time
-                pts = payload
-                rel = t - s
-                chosen = pts[0]
-                for p in pts:
-                    if int(g(p, "Time", 0)) <= rel:
-                        chosen = p
-                i = grid_to_dot(float(g(chosen, "X", 0)), float(g(chosen, "Y", 0)))
-                target[i] = max(
-                    target[i], norm_intensity(g(chosen, "Intensity", 0)) * intensity_ratio
-                )
+            else:  # path: glide between keyframes, soft spot over nearby motors
+                x, y, inten = path_at(payload, t - s)
+                spread_point(target, x, y, inten * intensity_ratio)
         timeline.append(("mapped", front, back))
     return timeline
+
+
+CLIP_FRAME_MS = 20  # SDK2 audio-derived clips: one 20-motor frame per 20 ms
+
+
+def _decode_clip_frame(b64):
+    """20 bytes = SDK1 dot order (row*4 + col), 0..100; >100 is padding
+    (255 fills the unused last byte in most clips)."""
+    try:
+        raw = base64.b64decode(b64)[:20]
+    except (ValueError, TypeError):
+        raw = b""
+    vals = [0.0 if v > 100 else v / 100.0 for v in raw]
+    return vals + [0.0] * (20 - len(vals))
+
+
+def clip_project(mapping):
+    """SDK2 mappings authored from audio carry `audioFilePatterns` clips
+    instead of .tact tracks; keep the vest frames as a compact project."""
+    clips = []
+    for ap in mapping.get("audioFilePatterns") or []:
+        pats = (ap.get("clip") or {}).get("patterns") or {}
+        front, back = pats.get("VestFront") or [], pats.get("VestBack") or []
+        if front or back:
+            clips.append((front, back))
+    if not clips:
+        return None
+    try:
+        scale = float(mapping.get("intensity", 100)) / 100.0
+    except (TypeError, ValueError):
+        scale = 1.0
+    return {"_clips": clips, "_scale": scale}
+
+
+def compile_clip(project, intensity_ratio=1.0, duration_ratio=1.0):
+    # several clips on one event are layers authored to play together
+    # (e.g. "death" = dying heartbeat + a cough; the event's eventTime is the
+    # longest layer): combine them per motor with max so nothing overdrives
+    scale = project.get("_scale", 1.0) * intensity_ratio
+    n = max(max(len(f), len(b)) for f, b in project["_clips"])
+    ratio = duration_ratio if duration_ratio > 0 else 1.0
+    n_ticks = max(1, round(n * CLIP_FRAME_MS * ratio / TICK_MS))
+    decoded = {}
+
+    def frame(frames, i):
+        key = (id(frames), i)
+        if key not in decoded:
+            decoded[key] = [min(1.0, v * scale) for v in _decode_clip_frame(frames[i])]
+        return decoded[key]
+
+    timeline = []
+    for tick in range(n_ticks):
+        i = min(n - 1, int(tick * TICK_MS / ratio / CLIP_FRAME_MS))
+        front, back = [0.0] * 20, [0.0] * 20
+        for fr, bk in project["_clips"]:
+            for frames, out in ((fr, front), (bk, back)):
+                if i < len(frames):
+                    for m, v in enumerate(frame(frames, i)):
+                        if v > out[m]:
+                            out[m] = v
+        timeline.append(("mapped", front, back))
+    return timeline
+
+
+def compile_event(project, intensity_ratio=1.0, duration_ratio=1.0):
+    """Compile an SDK2 event definition (.tact project or audio clip)."""
+    if isinstance(project, dict) and "_clips" in project:
+        return compile_clip(project, intensity_ratio, duration_ratio)
+    return compile_project(project, intensity_ratio, duration_ratio)
+
+
+def event_duration_ms(project):
+    """Length of an event without compiling it (for ServerEventList)."""
+    if isinstance(project, dict) and "_clips" in project:
+        return max(max(len(f), len(b)) for f, b in project["_clips"]) * CLIP_FRAME_MS
+    return len(compile_project(project)) * TICK_MS
+
+
+def feel_test_timeline():
+    """~3 s probe for the Feel settings: a slow whole-vest swell (smoothness,
+    strength), then weak and strong taps (minimum level, punch)."""
+    tl = []
+    for k in range(75):  # 1.5 s swell up and down
+        v = 1.0 - abs(k - 37) / 37
+        tl.append(("mapped", [v] * 20, [v] * 20))
+    tl += [("mapped", [0.0] * 20, [0.0] * 20)] * 10
+    for lvl in (0.08, 0.15, 0.3, 0.6, 1.0):  # taps, weak to strong
+        tap = [0.0] * 20
+        for i in (5, 6, 9, 10):  # centre chest
+            tap[i] = lvl
+        tl += [("mapped", tap, [0.0] * 20)] * 4 + [("mapped", [0.0] * 20, [0.0] * 20)] * 8
+    return tl
 
 
 def parse_osc(data):
@@ -342,19 +567,67 @@ class VestLink:
         self.client = None
         self.last_sent = None
         self.battery = None
+        self.last_active = time.monotonic()
+        self.idle = False  # slept after IDLE_DISCONNECT_SECS idle to save battery
+        self._batt_tick = 0
+        self._absent_scans = 0  # while asleep: scans in a row that missed the vest
 
     @property
     def connected(self):
         return self.client is not None and self.client.is_connected
 
+    def mark_active(self):
+        """Haptics are being produced: keep/return the vest awake."""
+        self.last_active = time.monotonic()
+        if self.idle:
+            self.idle = False
+            log.info("vest wake: activity resumed, reconnecting")
+
+    async def _sleep_vest(self):
+        log.info("vest idle for %d min — disconnecting to save the battery",
+                 IDLE_DISCONNECT_SECS // 60)
+        self.idle = True
+        self._absent_scans = 0
+        dead, self.client = self.client, None
+        self.last_sent = None
+        with contextlib.suppress(Exception):
+            await dead.write_gatt_char(MOTOR_STABLE, bytes(20), response=False)
+            await dead.disconnect()
+
+    @staticmethod
+    async def _find(timeout):
+        return await BleakScanner.find_device_by_filter(
+            lambda d, adv: (d.name or "").startswith(VEST_NAME_PREFIXES),
+            timeout=timeout,
+        )
+
+    async def _watch_while_asleep(self):
+        """Asleep, we don't connect — but the vest going away (it powers
+        itself off once nothing is connected) and then advertising again
+        means someone switched it back on: that's a wake-up. A vest that
+        just stays on after we let go doesn't count, or it would never sleep."""
+        try:
+            present = await self._find(IDLE_SCAN_SECS) is not None
+        except Exception:  # e.g. BlueZ busy with another app's scan
+            present = None
+        if present is False:
+            self._absent_scans += 1
+        elif present:
+            if self._absent_scans >= 2 and self.idle:  # gone ≥2 scans, now back
+                log.info("vest wake: switched back on")
+                self.mark_active()
+                return
+            self._absent_scans = 0  # still on since we let go: keep sleeping
+        await asyncio.sleep(IDLE_SCAN_SECS)
+
     async def maintain(self):
         while True:
             if not self.connected:
+                if self.idle:
+                    await self._watch_while_asleep()
+                    continue
                 try:
-                    device = await BleakScanner.find_device_by_filter(
-                        lambda d, adv: (d.name or "").startswith(VEST_NAME_PREFIXES),
-                        timeout=10.0,
-                    )
+                    device = await self._find(10.0)
                     if device is None:
                         await asyncio.sleep(3)
                         continue
@@ -362,6 +635,7 @@ class VestLink:
                     await client.connect()
                     self.client = client
                     self.last_sent = None
+                    self.last_active = time.monotonic()
                     await self.read_battery()
                     log.info("vest connected: %s (%s), battery %s%%",
                              device.name, device.address, self.battery)
@@ -372,7 +646,11 @@ class VestLink:
                     await asyncio.sleep(3)
             else:
                 await asyncio.sleep(1)
-                self._batt_tick = getattr(self, "_batt_tick", 0) + 1
+                if (IDLE_DISCONNECT_SECS
+                        and time.monotonic() - self.last_active > IDLE_DISCONNECT_SECS):
+                    await self._sleep_vest()
+                    continue
+                self._batt_tick += 1
                 if self._batt_tick >= 60:
                     self._batt_tick = 0
                     await self.read_battery()
@@ -385,11 +663,10 @@ class VestLink:
             if data:
                 prev = self.battery if self.battery is not None else 100
                 self.battery = data[0]
-                if self.battery < 15 <= prev and shutil.which("notify-send"):
-                    subprocess.Popen(
-                        ["notify-send", "-u", "critical",
-                         "-i", "battery-caution", "bHaptics vest",
-                         f"Battery at {self.battery}% — plug the vest in"])
+                if self.battery < 15 <= prev:
+                    notify("bHaptics vest",
+                           f"Battery at {self.battery}% — plug the vest in",
+                           urgency="critical", icon="battery-caution")
 
     async def send(self, motors40):
         if not self.connected:
@@ -412,9 +689,24 @@ AUDIO_RATE = 48000
 AUDIO_CHUNK = 960  # 20 ms
 AUDIO_CONF = CONFIG_DIR / "audio_settings.json"
 PRESETS_FILE = CONFIG_DIR / "audio_presets.json"
+LEARNED_FILE = CONFIG_DIR / "audio_learned.json"
+MIGRATED_MARK = CONFIG_DIR / ".games-only-default"
 EFFECTS_FILE = CONFIG_DIR / "effects.json"
+# per-app learning: remembered settings keyed by app name, so a game you
+# tuned once comes back tuned — no preset naming required.
+# app-wide toggles: never stored in presets/learned tuning, never reverted by
+# a game-exit restore (turning notifications off mid-game must stick)
+GLOBAL_KEYS = ("enabled", "auto", "pad", "notify")
+LEARN_SKIP = GLOBAL_KEYS + ("source",)
+AUTOPROFILE_POLL = 4.0  # s between auto-follow scans of playing apps
+SDK1_PORT = 15881  # bHaptics Player SDK1 websocket + web UI (fixed by the SDK)
+SDK2_PORT = 15882  # SDK2 wss (fixed by the SDK)
 OSC_PORT = 9001  # VRChat sends avatar parameters here
+DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
+GAME_ACTIVE_WINDOW = 8.0  # s: while a game sends patterns, audio mode yields
+IDLE_DISCONNECT_SECS = 900  # s: sleep the vest after this long with no haptics
+IDLE_SCAN_SECS = 5.0  # s: asleep, scan this long (then pause as long) for a power-on
 
 
 SUR_SINK = "vest51"
@@ -422,18 +714,52 @@ SUR_MAP = "front-left,front-right,front-center,lfe,rear-left,rear-right"
 
 
 def pactl(*args):
-    return subprocess.run(["pactl", *args],
-                          capture_output=True, text=True).stdout
+    """Blocking — call from an executor thread, never on the event loop
+    (it would stall the 20 ms mixer tick). Returns "" on failure/hang."""
+    try:
+        return subprocess.run(["pactl", *args], capture_output=True,
+                              text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def sink_inputs():
     """Parsed `pactl list sink-inputs`; [] when pactl fails."""
     try:
-        return json.loads(subprocess.run(
-            ["pactl", "-f", "json", "list", "sink-inputs"],
-            capture_output=True, text=True).stdout)
-    except Exception:
+        return json.loads(pactl("-f", "json", "list", "sink-inputs"))
+    except ValueError:
         return []
+
+
+def strip_global(d):
+    return {k: v for k, v in d.items() if k not in GLOBAL_KEYS}
+
+
+def atomic_write_json(path, obj, indent=None):
+    """Write-then-rename so a crash mid-write can't truncate a config file
+    (the loaders treat unreadable JSON as empty and the next save wipes it)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=indent))
+    tmp.replace(path)
+
+
+def notify(title, body, urgency="normal", icon="input-gaming", replace=None):
+    """Desktop notification via notify-send, reusing one slot when `replace`
+    is given so a flapping vest or repeated game rebinds don't stack up."""
+    if not shutil.which("notify-send"):
+        return
+    cmd = ["notify-send", "-a", "bHaptics", "-u", urgency]
+    if icon:
+        cmd += ["-i", icon]
+    if replace:
+        cmd += ["-h", f"string:x-canonical-private-synchronous:{replace}"]
+    cmd += [title, body]
+
+    def run():
+        with contextlib.suppress(Exception):
+            subprocess.run(cmd, capture_output=True, timeout=10)
+
+    threading.Thread(target=run, daemon=True).start()  # reaps notify-send
 
 
 class AudioEngine:
@@ -470,10 +796,15 @@ class AudioEngine:
         self.impact_bl = self.impact_br = 0.0
         self._task = None
         self._proc = None
-        self.source = "default"
+        self.source = "auto"  # bind to whatever game is playing; silence otherwise
         self.start_enabled = True
         self.auto_profiles = True
         self.pad_mirror = False
+        self.notify = True
+        self.learned = {}  # app key (lowercase) -> remembered settings
+        if LEARNED_FILE.exists():
+            with contextlib.suppress(Exception):
+                self.learned = json.loads(LEARNED_FILE.read_text())
         if AUDIO_CONF.exists():
             with contextlib.suppress(Exception):
                 c = json.loads(AUDIO_CONF.read_text())
@@ -492,30 +823,75 @@ class AudioEngine:
                 self.agc = bool(c.get("agc", self.agc))
                 self.activity = float(c.get("activity", self.activity))
                 self.surround = bool(c.get("surround", False))
+                self.notify = bool(c.get("notify", self.notify))
         # legacy raw stream indexes don't survive reboots (appname: does)
         if self.source.startswith("app:"):
             self.source = "default"
+        # one-time: a source pinned to a single app is what made "audio on"
+        # feel like "off" for every other game. remember that app's tuning,
+        # then switch to games-only auto. the marker keeps an intentional
+        # per-app pin from being rewritten on later restarts.
+        first_run = not MIGRATED_MARK.exists()
+        if first_run and self.source.startswith("appname:") and self.auto_profiles:
+            app = self.source[len("appname:"):].lower()
+            self.learned.setdefault(app, self._snapshot())
+            self._save_learned()
+            self.source = "auto"
+            with contextlib.suppress(OSError, ValueError):
+                c = json.loads(AUDIO_CONF.read_text())
+                c["source"] = "auto"
+                atomic_write_json(AUDIO_CONF, c)
+            log.info("audio: learned settings for %r, switched to games-only auto", app)
+        if first_run:
+            with contextlib.suppress(OSError):
+                MIGRATED_MARK.touch()
         self.waiting = False
+        # PlayerState points this at the vest. An idle-slept vest still counts
+        # as ready: audio is what wakes it, so capture must keep running.
+        self.vest_ready = lambda: True
+        self.vest_gated = False
+
+    def _snapshot(self):
+        s = self.settings()
+        for k in LEARN_SKIP:
+            s.pop(k, None)
+        return s
+
+    def remember_app(self, app_key):
+        """Store the current tuning under an app so it returns next session."""
+        if not app_key:
+            return
+        self.learned[app_key.lower()] = self._snapshot()
+        self._save_learned()
+
+    def _save_learned(self):
+        with contextlib.suppress(OSError):
+            atomic_write_json(LEARNED_FILE, self.learned, indent=1)
 
     def settings(self):
+        # persist the *preference* (start_enabled), never the runtime state:
+        # shutdown and auto-follow toggle self.enabled, and writing that back
+        # would come up muted after a restart
         return {"gain": self.gain, "floor": self.floor,
                 "max": self.max_level, "stereo": self.stereo,
-                "enabled": self.enabled, "source": self.source,
+                "enabled": self.start_enabled, "source": self.source,
                 "impact": self.impact, "impGain": self.impact_gain,
                 "impMax": self.impact_max, "auto": self.auto_profiles,
                 "spread": self.spread, "pad": self.pad_mirror,
                 "agc": self.agc, "activity": self.activity,
-                "surround": self.surround}
+                "surround": self.surround, "notify": self.notify}
 
-    async def set_enabled(self, on):
+    async def set_enabled(self, on, intent=False):
+        if intent:
+            self.start_enabled = bool(on)
         if on and not self.enabled:
             self.enabled = True
-            self._task = asyncio.create_task(self._run())
+            self._task = asyncio.create_task(supervise("audio capture", self._run))
             log.info("audio mode ON (source %s)", self.source)
         elif not on and self.enabled:
             self.enabled = False
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
             self._stop_proc()
             self._zero_levels()
@@ -533,10 +909,12 @@ class AudioEngine:
         self.band_br = [0.0, 0.0, 0.0]
 
     def _stop_proc(self):
-        if self._proc is not None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
             with contextlib.suppress(ProcessLookupError):
-                self._proc.terminate()
-            self._proc = None
+                proc.terminate()
+            with contextlib.suppress(RuntimeError):  # no running loop at exit
+                asyncio.get_running_loop().create_task(proc.wait())  # reap it
 
     @staticmethod
     def _sink_id(name):
@@ -580,6 +958,10 @@ class AudioEngine:
     def _resolve_target(self):
         """Translate self.source into parec args; None if not available yet."""
         src = self.source
+        if src == "auto":
+            # games-only: the auto-follow loop binds an actual app when one
+            # plays; until then capture nothing (silence, not system audio)
+            return None
         if src.startswith("sink:"):
             return ["-d", src[5:] + ".monitor"]
         if src.startswith("appname:"):
@@ -604,10 +986,23 @@ class AudioEngine:
         """Capture supervisor: waits for the source, rebinds when streams die."""
         announced = False
         while True:
-            target = self._resolve_target()
+            if not self.vest_ready():
+                # no vest to drive: don't burn CPU capturing and DSP-ing audio
+                self.vest_gated = True
+                self.waiting = True
+                self._zero_levels()
+                if not announced:
+                    log.info("audio: waiting for the vest to connect")
+                    announced = True
+                await asyncio.sleep(1)
+                continue
+            self.vest_gated = False
+            target = await asyncio.get_running_loop().run_in_executor(
+                None, self._resolve_target)
             if target is None:
                 if not announced:
-                    log.info("audio: waiting for %s to play audio...", self.source)
+                    what = "a game" if self.source == "auto" else self.source
+                    log.info("audio: waiting for %s to play audio...", what)
                     announced = True
                 self.level_l = self.level_r = self.rel = 0.0
                 self.waiting = True
@@ -682,6 +1077,10 @@ class AudioEngine:
         buf = bytearray()
         try:
             while True:
+                if not self.vest_ready():
+                    log.info("audio: vest disconnected, pausing capture")
+                    self._zero_levels()
+                    return
                 chunk = await self._proc.stdout.read(65536)
                 if not chunk:
                     log.info("audio stream ended, will rebind")
@@ -820,29 +1219,99 @@ class AudioEngine:
 
 
 def list_audio_apps():
-    """Apps currently playing audio: lowercased name -> original name."""
-    out = {}
+    """Game-looking apps currently playing audio, newest stream first.
+
+    Returns `[{"key", "name", "index", "binary"}]`: `key` is the lowercased
+    name used for preset/learned matching, `name` the display name, `index`
+    the PipeWire sink-input id (higher == started later) so the most recently
+    launched app wins, and `binary` the process binary. An app is dropped when
+    either its name *or* its process binary is a known non-game — a browser or
+    Discord voice process can report a friendly `application.name` like
+    "WEBRTC VoiceEngine" while running as `Discord`."""
+    seen = {}
     for si in sink_inputs():
         props = si.get("properties", {})
-        app = (props.get("application.name")
-               or props.get("application.process.binary") or "")
-        if app:
-            out.setdefault(app.lower(), app)
-    return out
+        binary = (props.get("application.process.binary") or "")
+        name = (props.get("application.name") or binary)
+        if not name:
+            continue
+        key, bin_key = name.lower(), binary.lower()
+        if key in NON_GAME_APPS or bin_key in NON_GAME_APPS:
+            continue
+        idx = int(si.get("index", 0) or 0)
+        if key not in seen or idx > seen[key]["index"]:
+            seen[key] = {"key": key, "name": name, "index": idx,
+                         "binary": bin_key}
+    return sorted(seen.values(), key=lambda a: a["index"], reverse=True)
 
 
 # never auto-bind audio capture to these (browsers, comms, media players,
-# our own test tone players) — everything else is assumed to be a game
+# our own test tone players) — matched against both application.name and
+# application.process.binary
 NON_GAME_APPS = {
     "brave", "firefox", "chromium", "chrome", "google chrome", "vivaldi",
     "opera", "microsoft edge", "discord", "vesktop", "webcord", "spotify",
-    "mpv", "vlc", "vlc media player", "telegram", "telegram desktop",
+    "webrtc voiceengine", "electron", "mpv", "vlc", "vlc media player",
+    "telegram", "telegram desktop", "microsoft teams", "teams", "webex",
     "obs", "zoom", "slack", "signal", "easyeffects", "pavucontrol",
-    "kodi", "steam", "pacat", "paplay", "parec", "pw-play", "pw-cat",
+    "kodi", "steam", "steamwebhelper", "gamescope", "pacat", "paplay",
+    "parec", "pw-play", "pw-cat", "pipewire", "wireplumber",
     "speech-dispatcher", "plasmashell", "gnome-shell", "kwin_wayland",
-    "xdg-desktop-portal", "steamvr", "vrwebhelper", "vrserver",
+    "kded5", "kded6", "ksmserver", "plasma-browser-integration",
+    "xdg-desktop-portal", "xdg-desktop-portal-gtk", "xdg-desktop-portal-kde",
+    "steamvr", "vrwebhelper", "vrserver",
     "vrmonitor", "vrcompositor", "vrdashboard",
 }
+
+STEAM_ROOTS = (Path.home() / ".steam/steam",
+               Path.home() / ".local/share/Steam",
+               Path.home() / ".var/app/com.valvesoftware.Steam/data/Steam")
+# Proton games report binary wine-preloader/wine64-preloader, not the exe
+WINE_BINARIES = {"wine", "wine64", "wine-preloader", "wine64-preloader"}
+_game_names_cache = (0.0, frozenset())
+
+
+def installed_game_names():
+    """Lowercased names + install dirs of installed Steam games (cached 5 min).
+
+    Matching a stream's `application.name` against this is the strongest
+    "this is a game" signal available without touching the game process."""
+    global _game_names_cache
+    stamp, names = _game_names_cache
+    if stamp and time.monotonic() - stamp < 300:  # cache "no Steam" too
+        return names
+    found = set()
+    for root in STEAM_ROOTS:
+        libs = [str(root)]
+        vdf = root / "steamapps" / "libraryfolders.vdf"
+        with contextlib.suppress(OSError):
+            libs += re.findall(r'"path"\s+"([^"]+)"',
+                               vdf.read_text(errors="ignore"))
+        for lib in libs:
+            for mf in (Path(lib) / "steamapps").glob("appmanifest_*.acf"):
+                with contextlib.suppress(OSError):
+                    txt = mf.read_text(errors="ignore")
+                    for pat in (r'"name"\s+"([^"]+)"',
+                                r'"installdir"\s+"([^"]+)"'):
+                        m = re.search(pat, txt)
+                        if m:
+                            found.add(m.group(1).lower())
+    _game_names_cache = (time.monotonic(), frozenset(found))
+    if found:
+        log.info("detected %d installed Steam game names", len(found))
+    return _game_names_cache[1]
+
+
+def game_strength(entry, steam_names):
+    """How game-like a stream looks: 2 = Steam game, 1 = Windows/Proton exe,
+    0 = unknown (kept as a last resort so native games still auto-bind)."""
+    key = entry["key"]
+    base = key[:-4] if key.endswith(".exe") else key
+    if base in steam_names or key in steam_names:
+        return 2
+    if key.endswith(".exe") or entry.get("binary", "") in WINE_BINARIES:
+        return 1
+    return 0
 
 
 class PadMirror:
@@ -882,16 +1351,20 @@ class PadMirror:
     async def _scan(self):
         # Poll fast: Steam Input's virtual gamepad only appears at game launch
         # and the game binds it within ms, so a slow scan misses the window.
-        cooldown = {}  # dev path -> monotonic time its last mirror task ended
+        # cooldown is keyed by (path, inode): it stops a retry loop on the
+        # *same* node, but a node Steam re-created at the same path (new
+        # inode) must be grabbed at once — waiting lets the game bind it first
+        cooldown = {}  # (path, inode) -> monotonic time its last mirror task ended
         # probe each node once; inode changes when a device is re-created at
         # the same path, so genuinely new hardware still gets looked at
         rejected = set()  # (path, inode) of nodes without rumble
+        inodes = {}  # dev path -> inode of the node being mirrored
         while True:
             for path, t in list(self.tasks.items()):
                 if t.done():
                     self.tasks.pop(path)
                     self.names.pop(path, None)
-                    cooldown[path] = time.monotonic()
+                    cooldown[(path, inodes.pop(path, None))] = time.monotonic()
             for path in evdev.list_devices():
                 if path in self.tasks:
                     continue
@@ -901,7 +1374,7 @@ class PadMirror:
                     continue
                 if (path, ino) in rejected:
                     continue
-                last = cooldown.get(path)
+                last = cooldown.get((path, ino))
                 if last is not None and time.monotonic() - last < 10:
                     continue
                 try:
@@ -915,6 +1388,7 @@ class PadMirror:
                 except OSError:
                     continue
                 self.names[path] = dev.name
+                inodes[path] = ino
                 self.tasks[path] = asyncio.create_task(self._mirror(path, dev))
                 log.info("pad mirror: attached to %s (%s)", dev.name, path)
             await asyncio.sleep(0.5)
@@ -988,7 +1462,14 @@ class PadMirror:
         except asyncio.CancelledError:
             pass
         except OSError as e:
-            log.warning("pad mirror %s failed: %s (need /dev/uinput access?)", path, e)
+            if e.errno == errno.ENODEV:
+                # normal: the pad was unplugged, or Steam Input tore down its
+                # virtual pad (it re-creates them on game/config changes)
+                log.info("pad mirror: %s went away", path)
+            elif e.errno in (errno.EACCES, errno.EPERM):
+                log.warning("pad mirror %s failed: %s (need /dev/uinput access?)", path, e)
+            else:
+                log.warning("pad mirror %s failed: %s", path, e)
         finally:
             with contextlib.suppress(Exception):
                 dev.ungrab()
@@ -1047,6 +1528,8 @@ def extract_events(data, found=None, depth=0):
                 break
         if name:
             project = find_project(data)
+            if project is None and "audioFilePatterns" in data:
+                project = clip_project(data)
             if project is not None:
                 found.setdefault(name, project)
         for v in data.values():
@@ -1071,11 +1554,65 @@ def fetch_sdk2_definitions(workspace_id, api_key):
         return None
 
 
+SDK2_CACHE_RE = re.compile(r"^(auth|cloud)-([0-9A-Za-z]+?)(?:-\d{8}-\d{6})?\.json$")
+
+
+def sdk2_cache_workspace(filename):
+    m = SDK2_CACHE_RE.match(filename)
+    return m.group(2) if m else ""
+
+
+def _store_and_extract_sdk2(data, source):
+    """Cache one raw bundle per game (rewritten only when it changed) and
+    parse its events. Runs in an executor thread."""
+    text = data if isinstance(data, str) else json.dumps(data)
+    with contextlib.suppress(OSError):
+        SDK2_CACHE.mkdir(parents=True, exist_ok=True)
+        path = SDK2_CACHE / f"{source}.json"
+        try:
+            same = path.read_text() == text
+        except OSError:
+            same = False
+        if not same:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(text)
+            tmp.replace(path)
+    return extract_events(data)
+
+
+def dedupe_sdk2_cache():
+    """One-time cleanup of the old per-connect dumps (auth-<ws>-<stamp>.json):
+    keep the newest per game as auth-<ws>.json, drop byte-identical copies."""
+    groups = {}
+    for f in SDK2_CACHE.glob("*-*.json"):
+        m = SDK2_CACHE_RE.match(f.name)
+        if m and f.stem != f"{m.group(1)}-{m.group(2)}":
+            groups.setdefault(f"{m.group(1)}-{m.group(2)}", []).append(f)
+    removed = 0
+    for source, files in groups.items():
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        keep = SDK2_CACHE / f"{source}.json"
+        with contextlib.suppress(OSError):
+            kept = {keep.read_bytes()} if keep.exists() else set()
+            if not kept:
+                files[0].replace(keep)
+                kept.add(keep.read_bytes())
+                files = files[1:]
+            for f in files:
+                if f.read_bytes() in kept:  # only exact duplicates are dropped
+                    f.unlink()
+                    removed += 1
+    if removed:
+        log.info("sdk2 cache: removed %d duplicate dumps", removed)
+
+
 class PlayerState:
     def __init__(self, vest):
         self.vest = vest
         self.mapping = VestMapping()
+        self.feel = Feel()
         self.audio = AudioEngine()
+        self.audio.vest_ready = lambda: vest.connected or vest.idle
         self.registered = {}  # key -> raw project dict
         self.active = {}  # key -> Effect
         self.clients = set()
@@ -1096,8 +1633,18 @@ class PlayerState:
         # -inf, not 0: right after boot monotonic() is near 0 and 0.0 would
         # read as "OSC seen seconds ago", muting audio mode for no reason
         self.osc_last = float("-inf")
-        self.sdk2_events = {}  # eventName -> project dict
+        # a game client only pauses audio mode while it is actually driving the
+        # vest — a mod that connects but never sends patterns must not mute it
+        self.game_active_until = float("-inf")
+        self.sdk2_events = {}  # eventName -> project dict (all games + imports)
+        # workspace id -> {eventName -> project}: games reuse names like
+        # "death", so a connection looks up its own game's events first
+        self.sdk2_ws_events = {}
         self.auto_profile_app = ""  # display name while an auto profile is active
+        # auto-follow session: {"app", "preset", "saved", "saved_preset", "start"}
+        # — lives here (not in the loop) so UI/preset handlers and config
+        # persistence can see that a game is currently bound
+        self.auto_session = None
         self.pad = PadMirror(self)
         self._surtest = None
         self.patterns = set()  # keys loaded from patterns/*.tact (persisted)
@@ -1142,11 +1689,27 @@ class PlayerState:
 
     def _load_sdk2_cache(self):
         """Relearn SDK2 event definitions from previous sessions."""
+        dedupe_sdk2_cache()
         for f in sorted(SDK2_CACHE.glob("*.json")):
             with contextlib.suppress(Exception):
-                self.sdk2_events.update(extract_events(json.loads(f.read_text())))
+                events = extract_events(json.loads(f.read_text()))
+                self._learn_sdk2(events, sdk2_cache_workspace(f.name))
         if self.sdk2_events:
             log.info("sdk2: %d events restored from cache", len(self.sdk2_events))
+
+    def _learn_sdk2(self, events, workspace_id):
+        self.sdk2_events.update(events)
+        if workspace_id:
+            self.sdk2_ws_events.setdefault(workspace_id, {}).update(events)
+
+    def sdk2_event(self, name, workspace_id=""):
+        """Project for an SDK2 event: user imports win, then the calling
+        game's own definitions, then any game's."""
+        if name not in self.patterns:
+            project = self.sdk2_ws_events.get(workspace_id, {}).get(name)
+            if project is not None:
+                return project
+        return self.sdk2_events.get(name)
 
     @property
     def osc_active(self):
@@ -1154,20 +1717,26 @@ class PlayerState:
 
     @property
     def audio_suppressed(self):
-        return bool(self.game_clients) or self.osc_active
+        return (time.monotonic() < self.game_active_until) or self.osc_active
+
+    def touch_game(self):
+        """Mark a game SDK client as actively driving the vest; audio mode
+        yields to it only for a short window after each real pattern."""
+        self.game_active_until = time.monotonic() + GAME_ACTIVE_WINDOW
+
+    def notify(self, title, body, urgency="normal", icon="input-gaming", replace=None):
+        if self.audio.notify:
+            notify(title, body, urgency, icon, replace)
 
     def list_audio_sources(self):
-        out = [{"value": "default", "label": "System output (default)"}]
+        out = [{"value": "auto", "label": "Games only — auto (recommended)"},
+               {"value": "default", "label": "System output (all audio)"}]
         try:
-            sinks = json.loads(subprocess.run(
-                ["pactl", "-f", "json", "list", "sinks"],
-                capture_output=True, text=True).stdout)
+            sinks = json.loads(pactl("-f", "json", "list", "sinks"))
             for s in sinks:
                 out.append({"value": f"sink:{s['name']}",
                             "label": f"Output: {s.get('description', s['name'])}"})
-            inputs = json.loads(subprocess.run(
-                ["pactl", "-f", "json", "list", "sink-inputs"],
-                capture_output=True, text=True).stdout)
+            inputs = sink_inputs()
             seen = set()
             for si in inputs:
                 props = si.get("properties", {})
@@ -1189,7 +1758,10 @@ class PlayerState:
                 "ActiveKeys": list(self.active.keys()),
                 "ConnectedDeviceCount": 1 if self.vest.connected else 0,
                 "ConnectedPositions": ["Vest"] if self.vest.connected else [],
+                "VestIdle": bool(self.vest.idle),
+                "RemotePlay": remote_play_enabled(),
                 "Mapping": self.mapping.as_dict(),
+                "Feel": self.feel.as_dict(),
                 "AudioMode": self.audio.enabled,
                 "AudioStereo": self.audio.stereo,
                 "AudioGain": self.audio.gain,
@@ -1204,6 +1776,8 @@ class PlayerState:
                 "AudioAgc": self.audio.agc,
                 "AudioActivity": self.audio.activity,
                 "AudioSurround": self.audio.surround,
+                "AudioNotify": self.audio.notify,
+                "LearnedApps": sorted(self.audio.learned),
                 "AutoProfileApp": self.auto_profile_app,
                 "PadMirror": self.audio.pad_mirror,
                 "PadDevices": sorted(self.pad.names.values()),
@@ -1220,7 +1794,7 @@ class PlayerState:
             }
         )
 
-    async def handle(self, payload):
+    async def handle(self, payload, game=False):
         for reg in payload.get("Register") or []:
             key = reg.get("Key")
             project = reg.get("Project")
@@ -1240,10 +1814,14 @@ class PlayerState:
                 timeline = compile_frame_submit(sub.get("Frame") or {})
                 if timeline:
                     self.active[key or f"frame{time.monotonic()}"] = Effect(key, timeline)
+                    if game:
+                        self.touch_game()
             elif stype == "raw":
                 timeline = compile_raw_submit(sub.get("Frame") or {})
                 if timeline:
                     self.active[key or "raw"] = Effect(key, timeline)
+                    if game:
+                        self.touch_game()
             elif stype == "key":
                 params = sub.get("Parameters") or {}
                 project = self.registered.get(params.get("altKey") or key)
@@ -1258,6 +1836,18 @@ class PlayerState:
                 )
                 if timeline:
                     self.active[key] = Effect(key, timeline)
+                    if game:
+                        self.touch_game()
+
+        if isinstance(payload.get("Feel"), dict):
+            self.feel.update(payload["Feel"])
+            log.info("feel: %s", self.feel.as_dict())
+
+        if payload.get("Wake"):
+            self.vest.mark_active()
+
+        if payload.get("FeelTest"):
+            self.active["feeltest"] = Effect("feeltest", feel_test_timeline())
 
         if "SetMapping" in payload:
             try:
@@ -1269,17 +1859,31 @@ class PlayerState:
         if "AudioMode" in payload:
             am = payload["AudioMode"]
             if isinstance(am, dict):
+                am = dict(am)
+                if self.auto_session and am.get("source") == "auto":
+                    # "arm for games" while a game is bound: already in auto,
+                    # don't unbind the game that's playing
+                    am.pop("source")
                 await self.apply_audio_settings(am)
-                if any(k not in ("auto", "enabled") for k in am):
+                # tuning a game's sliders keeps its session; changing the
+                # source (or tuning outside a session) leaves the preset
+                tuned = any(k not in GLOBAL_KEYS for k in am)
+                if "source" in am or (tuned and not self.auto_session):
                     self.active_preset = ""
                 enabled = bool(am.get("enabled", self.audio.enabled))
             else:
                 enabled = bool(am)
-            await self.audio.set_enabled(enabled)
+            await self.audio.set_enabled(enabled, intent=True)
 
         if "PadMirror" in payload:
             self.audio.pad_mirror = bool(payload["PadMirror"])
             await self.pad.set_enabled(self.audio.pad_mirror)
+
+        if "RemotePlay" in payload:
+            want = bool(payload["RemotePlay"])
+            if want != remote_play_enabled():
+                set_remote_play(want)
+                asyncio.get_running_loop().call_later(0.4, _rebind)
 
         if (payload.get("SurroundTest")
                 and (self._surtest is None or self._surtest.done())):
@@ -1288,20 +1892,22 @@ class PlayerState:
         if "SavePreset" in payload:
             name = str(payload["SavePreset"]).strip()
             if name:
-                snap = self.audio.settings()
-                snap.pop("enabled", None)
-                snap.pop("auto", None)  # auto-profile is global, not per-preset
-                snap.pop("pad", None)   # pad mirror is global too
+                snap = strip_global(self.audio.settings())
                 self.presets[name] = snap
                 self._save_presets()
                 self.active_preset = name
+                sess = self.auto_session
+                if sess and name.lower() == sess["app"]:
+                    # "save this game as a preset": the session continues
+                    # under the preset instead of reading as a user override
+                    sess["preset"] = name
                 log.info("preset saved: %r", name)
 
         if "ApplyPreset" in payload:
             name = str(payload["ApplyPreset"])
             preset = self.presets.get(name)
             if preset:
-                await self.apply_audio_settings(preset)
+                await self.apply_audio_settings(strip_global(preset))
                 self.active_preset = name
                 log.info("preset applied: %r", name)
 
@@ -1312,6 +1918,12 @@ class PlayerState:
                 if self.active_preset == name:
                     self.active_preset = ""
                 log.info("preset deleted: %r", name)
+
+        if payload.get("ForgetLearned"):
+            n = len(self.audio.learned)
+            self.audio.learned.clear()
+            self.audio._save_learned()
+            log.info("auto-learned settings cleared (%d apps)", n)
 
         if "SaveEffect" in payload:
             fx = payload["SaveEffect"]
@@ -1394,14 +2006,14 @@ class PlayerState:
         if "PlayEvent" in payload:
             name = str(payload["PlayEvent"])
             project = self.sdk2_events.get(name)
-            timeline = compile_project(project) if project is not None else []
+            timeline = compile_event(project) if project is not None else []
             if timeline:
                 self.active[f"sdk2ui:{name}"] = Effect(name, timeline)
 
     def _save_effects(self):
         with contextlib.suppress(OSError):
-            EFFECTS_FILE.write_text(json.dumps(
-                {k: v for k, v in self.effects.items() if not k.startswith("__")}))
+            atomic_write_json(EFFECTS_FILE,
+                              {k: v for k, v in self.effects.items() if not k.startswith("__")})
 
     async def apply_audio_settings(self, d):
         a = self.audio
@@ -1415,6 +2027,7 @@ class PlayerState:
         a.auto_profiles = bool(d.get("auto", a.auto_profiles))
         a.spread = bool(d.get("spread", a.spread))
         a.agc = bool(d.get("agc", a.agc))
+        a.notify = bool(d.get("notify", a.notify))
         a.activity = min(10.0, max(1.0, float(d.get("activity", a.activity))))
         new_src = str(d.get("source", a.source))
         new_sur = bool(d.get("surround", a.surround))
@@ -1422,26 +2035,28 @@ class PlayerState:
             was_enabled = a.enabled
             await a.set_enabled(False)
             if a.surround and not new_sur:
-                a.teardown_surround()
+                await asyncio.get_running_loop().run_in_executor(
+                    None, a.teardown_surround)
             a.source, a.surround = new_src, new_sur
             if was_enabled:
                 await a.set_enabled(True)
+        # binding audio (auto or manual) is intent to use the vest: wake it
+        # even though capture is gated while it sleeps
+        self.vest.mark_active()
 
     def _save_presets(self):
         with contextlib.suppress(OSError):
-            PRESETS_FILE.write_text(json.dumps(self.presets, indent=1))
+            atomic_write_json(PRESETS_FILE, self.presets, indent=1)
 
-    def ingest_sdk2_defs(self, data, source):
+    async def ingest_sdk2_defs(self, data, source, workspace_id):
         if data is None:
             return
-        SDK2_CACHE.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        (SDK2_CACHE / f"{source}-{stamp}.json").write_text(
-            json.dumps(data) if not isinstance(data, str) else data
-        )
-        events = extract_events(data)
+        # bundles run to megabytes: parse and write off the event loop so
+        # the mixer keeps its 20 ms tick while a game connects
+        events = await asyncio.get_running_loop().run_in_executor(
+            None, _store_and_extract_sdk2, data, source)
         if events:
-            self.sdk2_events.update(events)
+            self._learn_sdk2(events, workspace_id)
             log.info("sdk2: learned %d events from %s: %s",
                      len(events), source, list(events)[:10])
         else:
@@ -1472,18 +2087,23 @@ class PlayerState:
 
         if mtype in ("SdkRequestAuth", "SdkRequestAuthInit", "SdkRequestReInit"):
             if g(inner, "Haptic") is not None:
-                self.ingest_sdk2_defs(g(inner, "Haptic"), f"auth-{workspace_id}")
-            if workspace_id and not self.sdk2_events:
+                await self.ingest_sdk2_defs(g(inner, "Haptic"), f"auth-{workspace_id}",
+                                            workspace_id)
+            # fetch when *this* game is unknown — events cached from other
+            # games used to block the fetch for every new game
+            if workspace_id and not self.sdk2_ws_events.get(workspace_id):
                 data = await asyncio.get_running_loop().run_in_executor(
                     None, fetch_sdk2_definitions, workspace_id, api_key
                 )
                 if data:
-                    self.ingest_sdk2_defs(g(data, "Message", data), f"cloud-{workspace_id}")
+                    await self.ingest_sdk2_defs(g(data, "Message", data),
+                                                f"cloud-{workspace_id}", workspace_id)
             await reply("ServerReady", "")
             await send_devices()
+            events = self.sdk2_ws_events.get(workspace_id) or self.sdk2_events
             event_list = [
-                {"eventName": name, "eventTime": len(compile_project(p)) * TICK_MS if p else 1000}
-                for name, p in self.sdk2_events.items()
+                {"eventName": name, "eventTime": event_duration_ms(p) if p else 1000}
+                for name, p in events.items()
             ]
             await reply("ServerEventList", event_list)
 
@@ -1500,16 +2120,17 @@ class PlayerState:
                 ticks = max(1, duration // TICK_MS)
                 timeline = [("mapped", vals[:20], vals[20:])] * ticks
                 self.active[f"sdk2:{req_id}"] = Effect("dot", timeline)
+                self.touch_game()
 
         elif mtype == "SdkPlay":
             name = g(inner, "EventName", "")
             req_id = g(inner, "RequestId", 0)
             intensity = float(g(inner, "Intensity", 1.0))
             duration = float(g(inner, "Duration", 1.0)) or 1.0
-            project = self.sdk2_events.get(name)
+            project = self.sdk2_event(name, workspace_id)
             timeline = []
             if project is not None:
-                timeline = compile_project(
+                timeline = compile_event(
                     project, intensity_ratio=intensity, duration_ratio=duration
                 )
             if not timeline:
@@ -1521,6 +2142,7 @@ class PlayerState:
                 ticks = max(1, int(250 * duration) // TICK_MS)
                 timeline = [("mapped", [lvl] * 20, [lvl] * 20)] * ticks
             self.active[f"sdk2:{req_id}"] = Effect(name, timeline)
+            self.touch_game()
 
         elif mtype == "SdkStopAll":
             for k in [k for k in self.active if k.startswith("sdk2:")]:
@@ -1540,7 +2162,7 @@ class PlayerState:
         """Play a 5.1 quadrant sweep into the virtual sink so positional
         haptics can be verified without configuring any game."""
         a = self.audio
-        a._ensure_surround_sink()
+        await asyncio.get_running_loop().run_in_executor(None, a._ensure_surround_sink)
         # already capturing vest51 (game routed through it)? just mix in
         bound = (a.enabled and a.surround and not a.waiting
                  and (a.source.startswith("appname:")
@@ -1618,6 +2240,7 @@ class PlayerState:
         self.active[key] = Effect(key, timeline)
 
     async def mixer(self):
+        next_tick = time.monotonic()
         while True:
             front = [0.0] * 20
             back = [0.0] * 20
@@ -1681,20 +2304,71 @@ class PlayerState:
                         front[i] = max(front[i], il * w + ir * (1 - w))
                         back[i] = max(back[i], ibl * w + ibr * (1 - w))
 
-            motors = [0] * 40
+            levels = raw[:]  # raw motor submits are already in physical order
             for i in range(20):
-                motors[self.mapping.front[i]] = max(
-                    motors[self.mapping.front[i]], round(front[i] * 15)
-                )
-                motors[self.mapping.back[i]] = max(
-                    motors[self.mapping.back[i]], round(back[i] * 15)
-                )
-            for i in range(40):
-                motors[i] = max(motors[i], round(raw[i] * 15))
+                fi, bi = self.mapping.front[i], self.mapping.back[i]
+                levels[fi] = max(levels[fi], front[i])
+                levels[bi] = max(levels[bi], back[i])
+            motors = self.feel.shape(levels)
 
             self.last_motors = motors
+            if any(motors):
+                self.vest.mark_active()
             await self.vest.send(motors)
-            await asyncio.sleep(TICK_MS / 1000)
+            # fixed-rate ticks: sleeping a flat 20 ms after the work + BLE
+            # write made the real rate drift below 50 Hz
+            next_tick += TICK_MS / 1000
+            now = time.monotonic()
+            if next_tick < now - 0.1:  # fell far behind (BLE stall): resync
+                next_tick = now
+            await asyncio.sleep(max(0.0, next_tick - now))
+
+    def persisted_settings(self):
+        """What goes to audio_settings.json: while a game is auto-bound, the
+        pre-game setup (plus current global toggles) — so a shutdown mid-game
+        doesn't make that game's source and tuning the new defaults."""
+        cur = self.audio.settings()
+        sess = self.auto_session
+        if not sess:
+            return cur
+        base = dict(sess["saved"])
+        base.update({k: cur[k] for k in GLOBAL_KEYS if k in cur})
+        return base
+
+    async def _auto_bind(self, key, name, preset=None):
+        """Bind audio capture to a playing app (optionally via its preset)."""
+        a = self.audio
+        prev = self.auto_session
+        if prev:  # switching games: keep what was tuned for the old one
+            self._auto_remember(prev)
+        cfg = strip_global(self.presets[preset] if preset else a.learned.get(key) or {})
+        cfg["source"] = "appname:" + name
+        saved = prev["saved"] if prev else a.settings()
+        saved_preset = prev["saved_preset"] if prev else self.active_preset
+        await self.apply_audio_settings(cfg)
+        await a.set_enabled(True)
+        self.active_preset = preset or ""
+        self.auto_session = {"app": key, "preset": preset, "saved": saved,
+                             "saved_preset": saved_preset, "start": a._snapshot()}
+        self.auto_profile_app = name
+
+    def _auto_remember(self, sess):
+        # only store tuning the user actually changed; an untouched game
+        # must keep following the global settings
+        if not sess["preset"] and self.audio._snapshot() != sess["start"]:
+            self.audio.remember_app(sess["app"])
+
+    async def _auto_end(self, restore=True):
+        sess, self.auto_session = self.auto_session, None
+        self.auto_profile_app = ""
+        if sess is None:
+            return
+        self._auto_remember(sess)
+        if restore:
+            a = self.audio
+            await self.apply_audio_settings(strip_global(sess["saved"]))
+            await a.set_enabled(a.start_enabled)
+            self.active_preset = sess["saved_preset"]
 
     async def autoprofile_loop(self):
         """Auto-apply a preset when an app whose name matches one starts playing.
@@ -1703,78 +2377,92 @@ class PlayerState:
         and it gets applied — source bound to that app — the moment the game
         makes sound; the previous audio setup is restored when it exits.
 
-        Fallback when no preset matches: any new app that isn't an obvious
-        non-game (NON_GAME_APPS) gets the capture bound to it with the current
-        slider settings, so unsupported games buzz via audio mode with zero
-        setup. Same restore-on-exit and hands-off-on-user-override rules.
+        Fallback when no preset matches: the most game-like playing app (Steam
+        game > Proton exe > anything not in NON_GAME_APPS) gets the capture
+        bound with its remembered tuning. Same restore-on-exit rules; a user
+        source/preset change hands the app over to them until it stops.
         """
         loop = asyncio.get_running_loop()
-        current = None  # {"app", "preset", "saved", "saved_enabled", "saved_preset"}
         suppressed = set()  # apps the user overrode; skip until their stream is gone
         while True:
-            await asyncio.sleep(4)
+            await asyncio.sleep(AUTOPROFILE_POLL)
             a = self.audio
             if not a.auto_profiles:
-                if current:
-                    current = None
-                    self.auto_profile_app = ""
+                if self.auto_session:
+                    await self._auto_end(restore=False)
                 continue
-            apps = await loop.run_in_executor(None, list_audio_apps)
+            rows = await loop.run_in_executor(None, list_audio_apps)
+            apps = {r["key"]: r["name"] for r in rows}
+            order = [r["key"] for r in rows]  # newest stream first
+            steam_names = await loop.run_in_executor(None, installed_game_names)
+            strength = {r["key"]: game_strength(r, steam_names) for r in rows}
             suppressed &= set(apps)
-            if current:
-                expect_src = "appname:" + apps.get(current["app"], "")
-                if current["app"] not in apps:
-                    await self.apply_audio_settings(current["saved"])
-                    await a.set_enabled(current["saved_enabled"])
-                    self.active_preset = current["saved_preset"]
+            sess = self.auto_session
+            if sess:
+                if sess["app"] not in apps:
+                    await self._auto_end()
                     log.info("auto profile: %r closed, previous audio setup restored",
-                             current["preset"] or current["app"])
-                    current = None
-                    self.auto_profile_app = ""
-                elif (self.active_preset != (current["preset"] or "")
-                      or a.source != expect_src or not a.enabled):
-                    # user changed preset/source/off while active: hands off
-                    suppressed.add(current["app"])
-                    current = None
-                    self.auto_profile_app = ""
+                             sess["preset"] or sess["app"])
+                    self.notify("Haptics off", f"{sess['app']} closed",
+                                urgency="low", replace="bhaptics-game")
+                elif not a.start_enabled:
+                    # user switched audio haptics off mid-game: stay off, but
+                    # put the pre-game source back so a restart isn't pinned
+                    await self._auto_end()
+                    log.info("auto profile: audio turned off, released %s", sess["app"])
+                elif (self.active_preset != (sess["preset"] or "")
+                      or a.source != "appname:" + apps[sess["app"]]):
+                    # user picked another preset/source while active: hands off
+                    await self._auto_end(restore=False)
+                    suppressed.add(sess["app"])
+                elif not sess["preset"]:
+                    # a more game-like stream appeared (e.g. a Steam game after
+                    # a generic process): move to it rather than staying stuck
+                    cur = strength.get(sess["app"], 0)
+                    better = next((k for k in order
+                                   if k not in suppressed
+                                   and strength.get(k, 0) > cur), None)
+                    if better is not None:
+                        await self._auto_bind(better, apps[better])
+                        log.info("auto follow: switching to %s", apps[better])
+                        self.notify(f"Haptics: {apps[better]}",
+                                    "audio haptics active — tune it and it'll be kept",
+                                    replace="bhaptics-game")
                 continue
-            for name in sorted(self.presets):
-                key = name.lower()
-                if key not in apps or key in suppressed:
-                    continue
-                saved = a.settings()
-                saved_enabled = a.enabled
-                saved_preset = self.active_preset
-                cfg = dict(self.presets[name])
-                cfg["source"] = "appname:" + apps[key]
-                await self.apply_audio_settings(cfg)
-                await a.set_enabled(True)
-                self.active_preset = name
-                current = {"app": key, "preset": name, "saved": saved,
-                           "saved_enabled": saved_enabled, "saved_preset": saved_preset}
-                self.auto_profile_app = apps[key]
-                log.info("auto profile: %r applied for %s", name, apps[key])
-                break
-            if current or self.audio_suppressed:
+            if not a.start_enabled:
+                continue  # audio haptics switched off: off means off
+            preset_by_app = {n.lower(): n for n in self.presets}
+            match = next((k for k in order
+                          if k not in suppressed and k in preset_by_app), None)
+            if match is not None:
+                name = preset_by_app[match]
+                await self._auto_bind(match, apps[match], preset=name)
+                log.info("auto profile: %r applied for %s", name, apps[match])
+                self.notify(f"Haptics: {name}", f"preset active for {apps[match]}",
+                            replace="bhaptics-game")
+                continue
+            if self.audio_suppressed:
                 continue
             bound = (a.source[len("appname:"):].lower()
                      if a.source.startswith("appname:") else None)
             if bound and bound in apps:
-                continue  # bound app still playing — nothing to take over
-            for key in sorted(apps):
-                if key in suppressed or key in NON_GAME_APPS:
+                continue  # manually bound app still playing — leave it
+            best = None
+            for r in rows:
+                if r["key"] in suppressed:
                     continue
-                saved = a.settings()
-                saved_enabled = a.enabled
-                saved_preset = self.active_preset
-                await self.apply_audio_settings({"source": "appname:" + apps[key]})
-                await a.set_enabled(True)
-                self.active_preset = ""
-                current = {"app": key, "preset": None, "saved": saved,
-                           "saved_enabled": saved_enabled, "saved_preset": saved_preset}
-                self.auto_profile_app = apps[key]
-                log.info("auto follow: audio mode bound to %s", apps[key])
-                break
+                st = strength.get(r["key"], 0)
+                if best is None or st > best[0]:
+                    best = (st, r)  # newest wins ties (rows are newest-first)
+            if best is not None:
+                key, name = best[1]["key"], best[1]["name"]
+                learned = key in a.learned
+                await self._auto_bind(key, name)
+                log.info("auto follow: bound to %s (strength %d%s)", name, best[0],
+                         ", remembered" if learned else "")
+                self.notify(f"Haptics: {name}",
+                            "audio haptics active — tune it and it'll be kept",
+                            replace="bhaptics-game")
 
     async def meter_loop(self):
         while True:
@@ -1789,6 +2477,7 @@ class PlayerState:
                     "surround": a.surround, "rearLive": a.rear_live,
                     "suppressed": self.audio_suppressed,
                     "waiting": a.enabled and a.waiting,
+                    "vestGated": a.vest_gated,
                 }, "Motors": self.last_motors})
                 for ws in list(self.meter_subs):
                     with contextlib.suppress(Exception):
@@ -1797,7 +2486,11 @@ class PlayerState:
 
     async def status_loop(self):
         last = None
-        saved_audio = self.audio.settings()
+        saved_audio = self.persisted_settings()
+        last_conn = None
+        last_sup = None
+        sup_since = None
+        paused_notice = float("-inf")
         while True:
             msg = self.status_message()
             if msg != last and self.clients:
@@ -1805,11 +2498,40 @@ class PlayerState:
                     with contextlib.suppress(Exception):
                         await ws.send(msg)
                 last = msg
-            cur = self.audio.settings()
+            cur = self.persisted_settings()
             if cur != saved_audio:
                 with contextlib.suppress(OSError):
-                    AUDIO_CONF.write_text(json.dumps(cur))
+                    atomic_write_json(AUDIO_CONF, cur)
                     saved_audio = cur
+            # notify on meaningful transitions only (not every reconnect loop)
+            conn = self.vest.connected
+            if last_conn is not None and conn != last_conn:
+                if conn:
+                    bat = (f" · battery {self.vest.battery}%"
+                           if self.vest.battery is not None else "")
+                    self.notify("Vest connected", f"haptics ready{bat}",
+                                replace="bhaptics-vest")
+                elif not self.vest.idle:
+                    self.notify("Vest disconnected", "searching for the vest…",
+                                icon="bluetooth", replace="bhaptics-vest")
+            last_conn = conn
+            sup = self.audio_suppressed
+            now = time.monotonic()
+            # every game pattern opens an 8 s window, so a game hitting you
+            # every ~20 s flaps this: tell once per stretch of play, and only
+            # announce "resumed" after a long game-driven stretch
+            if sup and not last_sup:
+                sup_since = now
+                if self.audio.enabled and now - paused_notice > 600:
+                    self.notify("Game controls the vest",
+                                "audio haptics paused while the game sends patterns",
+                                urgency="low", replace="bhaptics-sup")
+                    paused_notice = now
+            elif not sup and last_sup and sup_since is not None:
+                if self.audio.enabled and now - sup_since > 60:
+                    self.notify("Audio haptics resumed", "vest is back on game audio",
+                                urgency="low", replace="bhaptics-sup")
+            last_sup = sup
             await asyncio.sleep(1)
 
 
@@ -1820,12 +2542,15 @@ async def ws_handler(ws, state):
     app_id = (q.get("app_id") or [""])[0]
     app_name = (q.get("app_name") or [""])[0]
     is_game = app_id != "ui"
-    log.info("client connected: %s%s", ws.request.path, " (game)" if is_game else "")
+    # UI/tray/vestctl reconnect constantly (the tray polls every 2 s): debug only
+    (log.info if is_game else log.debug)("client connected: %s%s", ws.request.path,
+                                         " (game)" if is_game else "")
     state.clients.add(ws)
     if is_game:
         state.game_clients[ws] = app_name or app_id or "unnamed client"
-        if state.audio.enabled:
-            log.info("audio mode suppressed: game client connected")
+        state.vest.mark_active()  # a game is here: wake the vest if it slept
+        log.info("game client connected: %s (audio yields while it sends patterns)",
+                 app_name or app_id or "unnamed client")
     try:
         await ws.send(state.status_message())
         async for raw in ws:
@@ -1838,7 +2563,9 @@ async def ws_handler(ws, state):
                 state.meter_subs.add(ws)
                 continue
             if payload.get("ListAudioSources"):
-                await ws.send(json.dumps({"AudioSources": state.list_audio_sources()}))
+                sources = await asyncio.get_running_loop().run_in_executor(
+                    None, state.list_audio_sources)
+                await ws.send(json.dumps({"AudioSources": sources}))
                 continue
             if payload.get("GetEffect"):
                 name = str(payload["GetEffect"])
@@ -1873,7 +2600,13 @@ async def ws_handler(ws, state):
                            if isinstance(res, subprocess.CompletedProcess) else str(res))
                     await ws.send(json.dumps({"ImportNote": f"🩺 doctor failed: {err}"}))
                 continue
-            await state.handle(payload)
+            try:
+                await state.handle(payload, game=is_game)
+            except Exception:
+                # one malformed field (e.g. intensityRatio: null) must not
+                # drop the game's whole connection
+                log.exception("bad message from %s: %.200s", app_name or app_id, raw)
+                continue
             if "ImportTact" in payload:
                 await ws.send(json.dumps({"ImportNote": state.import_note}))
             await ws.send(state.status_message())
@@ -1883,9 +2616,7 @@ async def ws_handler(ws, state):
         state.clients.discard(ws)
         state.meter_subs.discard(ws)
         state.game_clients.pop(ws, None)
-        if is_game and not state.audio_suppressed and state.audio.enabled:
-            log.info("audio mode resumed: no game clients left")
-        log.info("client disconnected")
+        (log.info if is_game else log.debug)("client disconnected")
 
 
 async def sdk2_handler(ws, state):
@@ -1896,6 +2627,7 @@ async def sdk2_handler(ws, state):
     api_key = (q.get("api_key") or [""])[0]
     log.info("sdk2 client connected: workspace_id=%r", workspace_id)
     state.game_clients[ws] = f"SDK2: {workspace_id or 'unknown'}"
+    state.vest.mark_active()  # a game is here: wake the vest if it slept
     try:
         async for raw in ws:
             try:
@@ -1903,7 +2635,12 @@ async def sdk2_handler(ws, state):
             except json.JSONDecodeError:
                 log.warning("sdk2 bad json: %.120s", raw)
                 continue
-            await state.handle_sdk2(ws, payload, workspace_id, api_key)
+            try:
+                await state.handle_sdk2(ws, payload, workspace_id, api_key)
+            except websockets.ConnectionClosed:
+                raise
+            except Exception:
+                log.exception("sdk2 bad message: %.200s", raw)
     except websockets.ConnectionClosed:
         pass
     finally:
@@ -1930,11 +2667,22 @@ def sdk2_ssl_context():
     return ctx
 
 
+def _is_loopback(addr):
+    if not addr:
+        return False
+    host = addr[0]
+    return host == "::1" or host.startswith("127.")
+
+
 def process_request(connection, request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return None
     path = urlparse(request.path).path
     if path in ("/", "/ui", "/ui.html"):
+        # The control UI shares the SDK1 port; never serve it off-box even when
+        # the SDK endpoints are LAN-bound for Remote Play.
+        if not _is_loopback(connection.remote_address):
+            return connection.respond(http.HTTPStatus.FORBIDDEN, "UI is local-only\n")
         try:
             body = UI_FILE.read_text()
         except OSError:
@@ -1947,8 +2695,40 @@ def process_request(connection, request):
     return connection.respond(http.HTTPStatus.NOT_FOUND, "not found\n")
 
 
+async def supervise(name, fn):
+    """Run a forever-loop; if it crashes, log it and restart it rather than
+    leaving the daemon half-dead (e.g. auto-follow silently gone)."""
+    while True:
+        try:
+            await fn()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s loop crashed — restarting in 2 s", name)
+            await asyncio.sleep(2)
+
+
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        parts = data.decode(errors="replace").split()
+        if len(parts) != 3 or parts[0] != "BHAPTICS-LINUX/1" or parts[1] != "DISCOVER":
+            return
+        reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {socket.gethostname()} "
+                 f"{SDK1_PORT} {SDK2_PORT} {OSC_PORT}")
+        self.transport.sendto(reply.encode(), addr)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # websockets logs every open/close/HTTP request at INFO: journal noise
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     migrate_legacy_state()
     vest = VestLink()
     state = PlayerState(vest)
@@ -1963,36 +2743,48 @@ async def main():
     if state.audio.pad_mirror:
         await state.pad.set_enabled(True)
 
+    listen_host = bind_address()
+    if listen_host not in ("127.0.0.1", "::1", "localhost"):
+        log.warning("listening on %s: SDK1/SDK2/OSC are unauthenticated — "
+                    "trusted networks only (Remote Play), see README", listen_host)
+        try:
+            await loop.create_datagram_endpoint(
+                DiscoveryProtocol, local_addr=("0.0.0.0", DISCOVERY_PORT))
+            log.info("discovery: answering LAN probes on udp://0.0.0.0:%d", DISCOVERY_PORT)
+        except OSError as e:
+            log.warning("discovery port %d unavailable (%s)", DISCOVERY_PORT, e)
+
     try:
         await loop.create_datagram_endpoint(
-            lambda: OscProtocol(state), local_addr=("127.0.0.1", OSC_PORT))
-        log.info("OSC (VRChat) listening on udp://127.0.0.1:%d", OSC_PORT)
+            lambda: OscProtocol(state), local_addr=(listen_host, OSC_PORT))
+        log.info("OSC (VRChat) listening on udp://%s:%d", listen_host, OSC_PORT)
     except OSError as e:
         log.warning("OSC port %d unavailable (%s) — VRChat bridge disabled", OSC_PORT, e)
 
-    tasks = [
-        asyncio.create_task(vest.maintain()),
-        asyncio.create_task(state.mixer()),
-        asyncio.create_task(state.status_loop()),
-        asyncio.create_task(state.meter_loop()),
-        asyncio.create_task(state.autoprofile_loop()),
-    ]
+    tasks = [asyncio.create_task(supervise(name, fn)) for name, fn in (
+        ("vest link", vest.maintain),
+        ("mixer", state.mixer),
+        ("status", state.status_loop),
+        ("meter", state.meter_loop),
+        ("auto profile", state.autoprofile_loop),
+    )]
 
     # big max_size: definition manifests and Register payloads can be MBs.
     # ping_interval=None: game SDK clients don't answer RFC6455 pings (the
     # official Player never sends any), so the default 20s ping + 20s timeout
     # killed every game connection after exactly 40s.
     async with websockets.serve(
-        lambda ws: ws_handler(ws, state), "127.0.0.1", 15881,
+        lambda ws: ws_handler(ws, state), listen_host, SDK1_PORT,
         process_request=process_request, max_size=16 * 2**20,
         ping_interval=None,
     ), websockets.serve(
-        lambda ws: sdk2_handler(ws, state), "127.0.0.1", 15882,
+        lambda ws: sdk2_handler(ws, state), listen_host, SDK2_PORT,
         ssl=sdk2_ssl_context(), max_size=16 * 2**20,
         ping_interval=None,
     ):
-        log.info("SDK1 on ws://127.0.0.1:15881/v2/feedbacks — UI at http://127.0.0.1:15881/ui")
-        log.info("SDK2 on wss://127.0.0.1:15882/v3/feedback")
+        log.info("SDK1 on ws://%s:%d/v2/feedbacks — local UI at http://127.0.0.1:%d/ui",
+                 listen_host, SDK1_PORT, SDK1_PORT)
+        log.info("SDK2 on wss://%s:%d/v3/feedback", listen_host, SDK2_PORT)
         await stop.wait()
 
     await state.audio.set_enabled(False)

@@ -320,7 +320,7 @@
 <header class="appbar">
   <div class="inner">
     <div class="brand">🦺 bHaptics <b>Vest</b></div>
-    <div class="statuspill" id="status"><span class="dot"></span><span id="statustext">connecting…</span></div>
+    <div class="statuspill" id="status" onclick="if (lastStatus && lastStatus.VestIdle) { send({Wake: true}); toast('waking the vest…'); }"><span class="dot"></span><span id="statustext">connecting…</span></div>
     <div class="batt" id="batt" hidden><span class="case"><i id="battfill"></i></span><span class="num" id="battpct"></span></div>
     <div class="chips" id="game"></div>
     <button class="stopall" onclick="turnOffAll()">■&nbsp; Stop all</button>
@@ -365,6 +365,29 @@
       <button onclick="startWizard()">Start mapping wizard</button>
     </div>
   </div>
+  <div class="card">
+    <h2><span class="ico">✨</span>Feel</h2>
+    <div class="hint">How every effect (games, mods, audio) is turned into motor power.
+      Press “feel test” after a change: a slow swell, then taps from weak to strong.</div>
+    <div class="row" style="margin-top:12px">
+      <label>strength <input type="range" id="fstrength" min="0.25" max="2" step="0.05" value="1"
+        oninput="document.getElementById('fstrengthv').textContent = Math.round(this.value * 100) + '%'"
+        onchange="feelSend()">
+        <span class="val num" id="fstrengthv">100%</span></label>
+      <label>minimum level <input type="range" id="ffloor" min="0" max="6" step="1" value="0"
+        oninput="document.getElementById('ffloorv').textContent = this.value == 0 ? 'off' : this.value + '/15'"
+        onchange="feelSend()">
+        <span class="val num" id="ffloorv">off</span></label>
+    </div>
+    <div class="hint">minimum level: weak effects you can't feel get lifted to this step</div>
+    <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="fsmooth" checked onchange="feelSend()"><i></i></span>
+      smooth — blends neighbouring power steps over time for finer fades and rumble</label>
+    <label class="tog" style="margin-top:8px"><span class="switch"><input type="checkbox" id="fpunch" onchange="feelSend()"><i></i></span>
+      punch — a 20 ms full-power kick when a motor starts, for crisper hits</label>
+    <div class="row" style="margin-top:12px">
+      <button onclick="send({FeelTest: true})">▶ feel test</button>
+    </div>
+  </div>
 </section>
 
 <section id="sec-audio">
@@ -405,6 +428,9 @@
       <b class="num" id="activityv">5</b>/10 <span class="hint" id="dutyv" style="margin-left:8px"></span>
     </div>
 
+    <label class="tog" style="margin-top:8px"><span class="switch"><input type="checkbox" id="notify" checked onchange="audioSend()"><i></i></span>
+      desktop notifications — tell me when the vest connects or a game is picked up</label>
+
     <div class="groups" style="margin-top:16px">
       <div class="group">
         <h3>Rumble · bass</h3>
@@ -443,13 +469,15 @@
       <div class="group">
         <h3>Source</h3>
         <div class="row" style="margin:0">
-          <select id="asrc" onchange="audioSend()">
-            <option value="default">System output (default)</option>
+          <select id="asrc" onchange="sourceSend()">
+            <option value="auto">Games only — auto (recommended)</option>
+            <option value="default">System output (all audio)</option>
           </select>
           <button class="small" onclick="refreshSources()">↻ refresh</button>
         </div>
-        <div class="hint" style="margin:10px 0 0">pick the game's own stream so voice chat
-          and music don't buzz you</div>
+        <div class="hint" style="margin:10px 0 0"><b>Games only</b> follows whichever game
+          is playing — voice chat and music won't buzz you. Pick a specific stream to pin
+          audio mode to it instead.</div>
         <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox" id="surround" onchange="audioSend()"><i></i></span>
           surround positioning — rear audio rumbles your back panel</label>
         <button class="small" style="margin-top:8px"
@@ -472,7 +500,7 @@
       </div>
 
       <div class="group">
-        <h3>Presets</h3>
+        <h3>Presets &amp; learning</h3>
         <div class="row" style="margin:0 0 10px">
           <select id="preset" onchange="applyPreset()" style="max-width:200px">
             <option value="">— none —</option>
@@ -481,10 +509,28 @@
           <button class="small danger" onclick="deletePreset()">Delete</button>
         </div>
         <label class="tog"><span class="switch"><input type="checkbox" id="autoprof" checked onchange="audioSend()"><i></i></span>
-          auto per-game preset</label>
-        <div class="hint" style="margin:8px 0 0">name a preset exactly like the app in the source
-          list — it applies itself when that game plays sound, and reverts when it exits</div>
+          auto-apply per game</label>
+        <div class="hint" style="margin:8px 0 0">tune the vest while a game plays and the settings
+          are remembered for that game — no preset naming needed. Name a preset exactly like an
+          app to override it with a fixed profile.</div>
         <div class="statustext" style="color:var(--good)" id="autoinfo"></div>
+        <div class="row" style="margin:8px 0 0">
+          <button class="small" id="promotebtn" style="display:none" onclick="promoteLearned()">
+            ★ save current game as preset</button>
+          <button class="small danger" id="forgetbtn" style="display:none" onclick="forgetLearned()">
+            forget learned</button>
+          <span class="hint" id="learnedinfo" style="margin:0"></span>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>Remote Play</h3>
+        <label class="tog"><span class="switch"><input type="checkbox" id="remoteplay" onchange="remotePlaySend()"><i></i></span>
+          accept haptics from another PC</label>
+        <div class="hint" style="margin:8px 0 0">bind the Player on this device's LAN so a game
+          running on another PC (Steam Remote Play) can reach it — run
+          <code>tools/remote-relay.py</code> there and it finds this device automatically.
+          Turning it off returns to loopback-only; applies after a quick restart.</div>
       </div>
     </div>
   </div>
@@ -629,7 +675,9 @@ function connect() {
     }
     lastStatus = msg;
     const c = msg.ConnectedDeviceCount > 0;
-    setStatus(c ? "vest connected" : "searching for vest…", c);
+    if (c) setStatus("vest connected", true);
+    else if (msg.VestIdle) setStatus("vest asleep — click to wake", null);
+    else setStatus("searching for vest…", false);
     const batt = document.getElementById("batt");
     if (c && msg.Battery != null) {
       batt.hidden = false;
@@ -647,11 +695,22 @@ function connect() {
     }
     document.getElementById("audio").checked = !!msg.AudioMode;
     if ("AudioAuto" in msg) document.getElementById("autoprof").checked = !!msg.AudioAuto;
+    if ("AudioNotify" in msg) document.getElementById("notify").checked = !!msg.AudioNotify;
     if ("PadMirror" in msg) document.getElementById("padmir").checked = !!msg.PadMirror;
+    if ("RemotePlay" in msg) document.getElementById("remoteplay").checked = !!msg.RemotePlay;
     document.getElementById("padinfo").textContent =
       (msg.PadDevices || []).length ? "🎮 " + msg.PadDevices.join(", ") : "";
     document.getElementById("autoinfo").textContent =
       msg.AutoProfileApp ? "▶ active: " + msg.AutoProfileApp : "";
+    const learned = msg.LearnedApps || [];
+    document.getElementById("forgetbtn").style.display = learned.length ? "" : "none";
+    document.getElementById("promotebtn").style.display = msg.AutoProfileApp ? "" : "none";
+    document.getElementById("learnedinfo").textContent = learned.length
+      ? "remembered " + learned.length + " game" + (learned.length === 1 ? "" : "s") : "";
+    // the daemon swaps source + tuning when a game binds/exits or a preset
+    // applies: pull the controls in again so they never show stale values
+    const audioSig = [msg.AudioSource, msg.AutoProfileApp, msg.ActivePreset].join("|");
+    if (audioSig !== lastAudioSig) { lastAudioSig = audioSig; refreshAudioUI = true; }
     if ((!audioInit || refreshAudioUI) && "AudioGain" in msg) {
       audioInit = true; refreshAudioUI = false;
       document.getElementById("stereo").checked = !!msg.AudioStereo;
@@ -687,6 +746,16 @@ function connect() {
         ? "🎮 games asked for patterns we don't have: " + msg.MissingKeys.join(", ")
           + " — import mod files containing these names"
         : "";
+    if (msg.Feel && !feelInit) {
+      feelInit = true;
+      const f = msg.Feel;
+      document.getElementById("fstrength").value = f.strength;
+      document.getElementById("fstrengthv").textContent = Math.round(f.strength * 100) + "%";
+      document.getElementById("ffloor").value = f.floor;
+      document.getElementById("ffloorv").textContent = f.floor ? f.floor + "/15" : "off";
+      document.getElementById("fsmooth").checked = !!f.smooth;
+      document.getElementById("fpunch").checked = !!f.punch;
+    }
     if (!mappingDirty) fillMapping(msg);
   };
 }
@@ -723,7 +792,8 @@ function updateMeter(m) {
   document.getElementById("impl").style.width = (impHoldL * 100) + "%";
   document.getElementById("impr").style.width = (impHoldR * 100) + "%";
   document.getElementById("asup").textContent =
-    m.suppressed ? "⏸ paused — game connected"
+    m.suppressed ? "⏸ paused — game sending patterns"
+    : m.vestGated ? "⏳ waiting for the vest to connect…"
     : m.waiting ? "⏳ waiting for the selected app to play audio…" : "";
   document.getElementById("dutyv").textContent =
     m.agc && m.on ? "rumbling " + Math.round((m.duty || 0) * 100) + "% of the time" : "";
@@ -752,6 +822,12 @@ function fireRaw(motor, dur) {
   send({Submit: [{Type: "raw", Key: "ui-raw", Frame: {Motors: motors, DurationMillis: dur || duration()}}]});
 }
 function turnOffAll() { send({Submit: [{Type: "turnOffAll"}]}); }
+function remotePlaySend() {
+  const on = document.getElementById("remoteplay").checked;
+  send({RemotePlay: on});
+  toast(on ? "remote play on — re-binding on the LAN…" : "remote play off — back to loopback…");
+}
+
 function audioSend() {
   send({AudioMode: {enabled: document.getElementById("audio").checked,
                     stereo: document.getElementById("stereo").checked,
@@ -765,8 +841,20 @@ function audioSend() {
                     agc: document.getElementById("agc").checked,
                     activity: parseFloat(document.getElementById("activity").value) || 5,
                     surround: document.getElementById("surround").checked,
-                    source: document.getElementById("asrc").value || "default"}});
+                    notify: document.getElementById("notify").checked}});
   padsRender();
+}
+// the source goes out only when the user picks one: sending it with every
+// slider move re-sent a stale "auto" and unbound the game that was playing
+function sourceSend() {
+  send({AudioMode: {source: document.getElementById("asrc").value || "auto"}});
+}
+let feelInit = false;
+function feelSend() {
+  send({Feel: {strength: parseFloat(document.getElementById("fstrength").value),
+               floor: parseInt(document.getElementById("ffloor").value),
+               smooth: document.getElementById("fsmooth").checked,
+               punch: document.getElementById("fpunch").checked}});
 }
 function refreshSources() { send({ListAudioSources: true}); }
 function fillSources(list) {
@@ -802,6 +890,7 @@ function paint(id, v) {
   }
 }
 let refreshAudioUI = false;
+let lastAudioSig = null;
 function applyPreset() {
   const n = document.getElementById("preset").value;
   if (n) { refreshAudioUI = true; send({ApplyPreset: n}); }
@@ -814,6 +903,18 @@ function savePreset() {
 function deletePreset() {
   const n = document.getElementById("preset").value;
   if (n && confirm(`Delete preset "${n}"?`)) { send({DeletePreset: n}); toast(`preset "${n}" deleted`); }
+}
+function promoteLearned() {
+  const app = lastStatus && lastStatus.AutoProfileApp;
+  if (!app) return;
+  send({SavePreset: app});
+  toast(`saved "${app}" as a preset`);
+}
+function forgetLearned() {
+  if (confirm("Forget the settings remembered for all games?")) {
+    send({ForgetLearned: true});
+    toast("forgot learned game settings");
+  }
 }
 function fillPresets(names, active) {
   const sel = document.getElementById("preset");

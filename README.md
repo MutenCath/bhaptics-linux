@@ -26,23 +26,58 @@ project does it.
 - **SDK2 emulation** — `wss://127.0.0.1:15882/v3/feedback` (self-signed TLS;
   SDK2 clients skip validation by design). Handles auth, `SdkPlayDotMode`,
   `SdkPlay` with event definitions learned from the game or fetched from
-  bHaptics' public definitions API.
+  bHaptics' public definitions API — both `.tact`-style patterns and the
+  audio-authored clips newer games ship. Events are looked up per game, so
+  two games that both define `death` each get their own.
 - **VRChat OSC bridge** — `udp://127.0.0.1:9001`, official
   `bOSC/v2/VestFront|VestBack/0-19` avatar parameter convention.
 - **Audio-to-haptics** — multi-band DSP on any PipeWire source: bass →
   stereo rumble, 1–10 kHz onsets (sword hits, gunshots) → sharp taps on the
   upper chest. Optional **frequency spread** maps sub-bass / bass / low-mids
   to vest rows (deepest at the belly, mids at the chest) so frequency becomes
-  position. Per-application capture (game audio only — your Discord calls
-  won't buzz), named per-game presets, auto-pauses whenever a real haptics
-  client connects.
+  position. Otherwise **games only by default**: the vest binds to whichever
+  game starts making sound and stays silent the rest of the time, so Discord,
+  music and browser audio never buzz you (pick *System output* to capture
+  everything). Auto-pauses whenever a real haptics client connects.
+- **Learns each game** — tune the vest while a game plays and those settings
+  are remembered for that app, reapplied next session with no preset to name.
+  Promote a good one to a named preset in one click, or clear the memory with
+  `vestctl game --forget`. Explicit presets still win where you make one.
+- **Feel tuning** — one output stage shapes everything the vest plays: master
+  strength, a minimum level so weak effects don't vanish below what the coin
+  motors can start at, *smooth* (dithers between the vest's 16 power steps
+  over time for ~4x finer fades, on by default) and *punch* (a 20 ms kick
+  when a motor starts, for crisper hits). Path effects glide between
+  keyframes over a soft spot of nearby motors instead of hopping cell to
+  cell. UI "Feel" card with a feel test, or `vestctl feel --strength 120
+  --floor 2 --punch on --test`.
+- **Tray quick control** — optional `bhaptics-tray` puts live vest status in
+  your system tray with one-click mute/arm, stop-all, and open-UI, so you
+  don't have to keep a browser tab around. `install.sh` sets it up (it uses
+  the system `python-gobject` for the tray icon); packages list
+  `python-pystray` as optional.
+- **Idle auto-off** — after 15 minutes with no haptics the daemon disconnects
+  the vest to save its battery (it then powers itself off). It reconnects the
+  moment a game connects, sends a pattern, or the audio it follows makes
+  noise again — or when you switch the vest back on, click the status pill in
+  the UI, pick *Wake* in the tray, or run `vestctl wake`.
 - **Auto per-game presets** — name a preset exactly like the app in the
   source list (case-insensitive) and it applies itself, bound to that app's
   audio, the moment the game makes sound; your previous setup is restored
   when the game exits. No preset? Any new app that isn't an obvious
   non-game (browsers, Discord, media players, SteamVR itself) gets audio
-  mode bound to it automatically with your current settings, so unsupported
-  games just work with zero setup. Toggle in the UI or `vestctl auto on|off`.
+  mode bound to it automatically — with the settings you last tuned for it,
+  or your current ones the first time — so unsupported games just work with
+  zero setup. Detection matches a stream's *process binary* too, not just its
+  display name, so a Discord/browser voice process can't masquerade as a game
+  (it reports "WEBRTC VoiceEngine" while running as `Discord`), and installed
+  Steam game names are preferred — a real game taking over from some generic
+  stream binds automatically. Toggle in the UI, `vestctl auto on|off`, or arm
+  everything at once with `vestctl game on|off|toggle`. Desktop notifications
+  say when the vest connects and which game got picked up (toggleable in the
+  UI). A game mod that connects but never actually sends patterns no longer
+  silences audio haptics — the vest only yields while a game is really
+  driving it.
 - **Mod patterns** — import `.tact` files, SDK2 definition manifests (the
   JSON Unity/Unreal mods ship), or whole mod folders in the UI or with
   `vestctl import <dir>`; everything is pre-registered at startup under both
@@ -64,9 +99,11 @@ project does it.
   buzzes the belly/mid rows. No game files involved at all. Toggle in the
   UI or `vestctl pad on|off` (needs writable `/dev/uinput`; Steam setups
   usually have it).
-- **`vestctl` CLI** — `vestctl status | pulse | stop | audio | auto | pad |
-  preset | effect | play | import | sources | doctor | proton` for scripts
-  and hotkeys.
+- **`vestctl` CLI** — `vestctl status | pulse | stop | audio | auto | game |
+  feel | pad | preset | effect | play | import | sources | doctor | proton` for
+  scripts and hotkeys. `vestctl game on` arms games-only auto, `vestctl game
+  off` mutes everything — bind it in your desktop for a one-key haptics
+  suspend.
 
 ## Install
 
@@ -83,9 +120,16 @@ That creates a venv, installs deps (bleak, websockets, numpy), and sets up a
 to any BLE device named `TactSuit*`/`Tactot*`. Re-run `install.sh` after
 moving the folder. Open the UI, click a grid cell, feel the buzz.
 
-Settings live in `~/.config/bhaptics-linux/` (mapping, presets, effects,
-patterns) and `~/.local/state/bhaptics-linux/` (SDK2 cert + event cache);
-old in-repo state migrates automatically on first start.
+Because it installs a **user** service, run it from a terminal inside your
+graphical login session as your normal user — not over SSH and not with
+`sudo`. (On SteamOS, run it from Desktop Mode; the installer repairs a
+nested-session `XDG_RUNTIME_DIR` automatically.) Note that SteamOS's
+read-only rootfs means the `makepkg` route below won't survive an OS update.
+
+Settings live in `~/.config/bhaptics-linux/` (mapping, presets, learned
+per-app settings, effects, patterns) and `~/.local/state/bhaptics-linux/`
+(SDK2 cert + event cache); old in-repo state migrates automatically on first
+start.
 
 On Arch(-based) distros you can install system-wide instead:
 `cd packaging && makepkg -si` (disable the install.sh user unit first if
@@ -134,6 +178,43 @@ taps. The plugin source lives in `plugin/VestRumble/` (~200 lines, builds
 with `dotnet build`); tune strength per game in
 `BepInEx/config/org.bhaptics-linux.vestrumble.cfg`.
 
+## Remote Play (game on another PC)
+
+The daemon binds loopback only — matching the official Player — so a game
+running on a *different* PC (Steam Remote Play, Steam Link) can't reach it.
+Steam's streaming carries video, audio and controller input, never the game's
+haptics API calls, so native haptics need a bridge. Two pieces:
+
+On the **vest's device**, let the daemon listen on the LAN by setting the bind
+address and restarting it:
+
+```sh
+mkdir -p ~/.config/bhaptics-linux
+echo '{"bind": "0.0.0.0"}' > ~/.config/bhaptics-linux/network.json
+systemctl --user restart bhaptics-daemon
+```
+
+`BHAPTICS_BIND` in the environment overrides that file for manual runs; to set
+it on the service instead, add `Environment=BHAPTICS_BIND=0.0.0.0` via
+`systemctl --user edit bhaptics-daemon`. The web UI stays loopback-only
+regardless. On the **gaming PC**, run the relay so unmodified games still find
+the Player at 127.0.0.1 — it auto-discovers the device on the LAN:
+
+```sh
+tools/remote-relay.py             # finds the device automatically
+tools/remote-relay.py --list      # show what's on the LAN
+tools/remote-relay.py --host <ip> # fallback when broadcast can't cross (VLANs)
+```
+
+VRChat needs no relay: point its OSC output straight at the daemon with the
+launch option `--osc=9000:<vest-device-ip>:9001`.
+
+The SDK and OSC endpoints are **unauthenticated** (as is the official Player),
+so bind beyond loopback only on a trusted network and firewall the ports if in
+doubt. Bridged haptics also arrive slightly *before* the streamed video (the
+video is still buffered), so they can feel early — audio mode stays in sync
+because it taps the already-delayed audio.
+
 ## Vibecoded, and proud of it
 
 This project was built in one long session with
@@ -145,6 +226,16 @@ writes, both SDK sockets, a real SDK2 game mod under Proton, OSC, and the
 audio DSP. It exists because a TactSuit owner on Linux was tired of the vest
 being a Windows-only accessory. Read the code before trusting it with your
 hardware; that's good advice for human-written code too.
+
+## Development
+
+```sh
+ruff check .
+python -m unittest discover -s tests -t .    # protocol, audio, sdk2, feel, tray…
+```
+
+CI runs ruff, a compile/import check, the suite, the `ui.html` JS parse, and
+builds the Arch package.
 
 ## Credits & prior art
 

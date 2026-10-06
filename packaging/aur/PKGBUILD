@@ -1,6 +1,6 @@
 # Maintainer: MutenCath <anthropic@kaczki.org>
 pkgname=bhaptics-linux-git
-pkgver=0.0.1.r0.g0000000
+pkgver=0.0.2.r0.g0000000
 pkgrel=1
 pkgdesc="bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio-to-haptics over BLE, no Windows Player needed"
 arch=(any)
@@ -10,7 +10,9 @@ depends=(python python-websockets python-bleak python-numpy python-evdev
          bluez libpulse openssl)
 makedepends=(git dotnet-sdk)
 optdepends=('pipewire-pulse: audio-to-haptics capture (or pulseaudio)'
-            'dotnet-sdk: rebuild the VestRumble generic Unity plugin')
+            'dotnet-sdk: rebuild the VestRumble generic Unity plugin'
+            'python-pystray: system tray quick control (bhaptics-tray)'
+            'python-pillow: system tray icon')
 provides=(bhaptics-linux)
 conflicts=(bhaptics-linux)
 source=("$pkgname::git+$url.git")
@@ -30,6 +32,7 @@ package() {
   cd "$pkgname"
   install -Dm644 player_daemon.py "$pkgdir/usr/lib/bhaptics-linux/player_daemon.py"
   install -Dm644 ui.html "$pkgdir/usr/lib/bhaptics-linux/ui.html"
+  install -Dm755 tray.py "$pkgdir/usr/bin/bhaptics-tray"
   install -Dm755 tools/proton-sdk2-setup.sh \
     "$pkgdir/usr/lib/bhaptics-linux/tools/proton-sdk2-setup.sh"
   install -Dm755 tools/proton-wrap.sh \
@@ -41,6 +44,8 @@ package() {
     "$pkgdir/usr/lib/systemd/user/bhaptics-daemon.service"
   install -Dm644 packaging/bhaptics-vest.desktop \
     "$pkgdir/usr/share/applications/bhaptics-vest.desktop"
+  install -Dm644 packaging/bhaptics-tray.desktop \
+    "$pkgdir/usr/share/applications/bhaptics-tray.desktop"
   install -Dm644 packaging/vestctl.fish \
     "$pkgdir/usr/share/fish/vendor_completions.d/vestctl.fish"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
