@@ -1807,12 +1807,18 @@ class PlayerState:
             }
         )
 
+    def _drop_game_clients(self):
+        for ws in list(self.game_clients):
+            with contextlib.suppress(Exception):
+                asyncio.create_task(ws.close())
+
     def start_relay_host(self):
         if self.relay_host:
             return
         self.relay_host = True
         self.relay_error = ""
         asyncio.create_task(self._find_vest_host())
+        self._drop_game_clients()
 
     async def _find_vest_host(self):
         while self.relay_host and not self.host_remote:
@@ -1823,9 +1829,16 @@ class PlayerState:
                 self.host_remote = remote
                 self.relay_error = ""
                 log.info("relay host: forwarding haptics to %s", remote)
+                self._drop_game_clients()
             else:
                 self.relay_error = "no vest device found on the LAN — enable Remote Play there"
                 await asyncio.sleep(3)
+
+    async def wait_for_remote(self, timeout=4.0):
+        deadline = time.monotonic() + timeout
+        while self.relay_host and not self.host_remote and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        return bool(self.host_remote)
 
     def stop_relay_host(self):
         self.relay_host = False
@@ -1833,11 +1846,13 @@ class PlayerState:
         self.relay_error = ""
 
     async def proxy_sdk1(self, ws):
+        log.info("relay host: proxying SDK1 %s -> %s", ws.request.path, self.host_remote)
         uri = "ws://%s:%d%s" % (self.host_remote, SDK1_PORT, ws.request.path)
         async with websockets.connect(uri, max_size=16 * 2**20) as up:
             await self._pump(ws, up)
 
     async def proxy_sdk2(self, ws):
+        log.info("relay host: proxying SDK2 %s -> %s", ws.request.path, self.host_remote)
         uri = "wss://%s:%d%s" % (self.host_remote, SDK2_PORT, ws.request.path)
         async with websockets.connect(uri, ssl=sdk2_client_ssl_context(),
                                      max_size=16 * 2**20) as up:
@@ -1851,7 +1866,13 @@ class PlayerState:
                     await dst.send(msg)
             except Exception:
                 pass
-        await asyncio.gather(one(a, b), one(b, a))
+        tasks = [asyncio.create_task(one(a, b)), asyncio.create_task(one(b, a))]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle(self, payload, game=False):
         for reg in payload.get("Register") or []:
@@ -2612,12 +2633,15 @@ async def ws_handler(ws, state):
     # UI/tray/vestctl reconnect constantly (the tray polls every 2 s): debug only
     (log.info if is_game else log.debug)("client connected: %s%s", ws.request.path,
                                          " (game)" if is_game else "")
-    if is_game and state.relay_host and state.host_remote:
-        try:
-            await state.proxy_sdk1(ws)
-        except Exception as e:
-            state.relay_error = str(e)
-        return
+    if is_game and state.relay_host:
+        await state.wait_for_remote()
+        if state.host_remote:
+            try:
+                await state.proxy_sdk1(ws)
+            except Exception as e:
+                state.relay_error = str(e)
+                log.warning("relay host: SDK1 proxy failed: %s", e)
+            return
     state.clients.add(ws)
     if is_game:
         state.game_clients[ws] = app_name or app_id or "unnamed client"
@@ -2698,12 +2722,15 @@ async def sdk2_handler(ws, state):
     q = parse_qs(urlparse(ws.request.path).query)
     workspace_id = (q.get("workspace_id") or [""])[0]
     api_key = (q.get("api_key") or [""])[0]
-    if state.relay_host and state.host_remote:
-        try:
-            await state.proxy_sdk2(ws)
-        except Exception as e:
-            state.relay_error = str(e)
-        return
+    if state.relay_host:
+        await state.wait_for_remote()
+        if state.host_remote:
+            try:
+                await state.proxy_sdk2(ws)
+            except Exception as e:
+                state.relay_error = str(e)
+                log.warning("relay host: SDK2 proxy failed: %s", e)
+            return
     log.info("sdk2 client connected: workspace_id=%r", workspace_id)
     state.game_clients[ws] = f"SDK2: {workspace_id or 'unknown'}"
     state.vest.mark_active()  # a game is here: wake the vest if it slept
