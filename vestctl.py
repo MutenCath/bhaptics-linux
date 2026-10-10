@@ -2,6 +2,7 @@
 """Command-line control for the bhaptics-linux daemon."""
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 import websockets
 
 URI = "ws://127.0.0.1:15881/v2/feedbacks?app_id=ui&app_name=vestctl"
+KIND_LAUNCH = "steam-launch"   # the launch-option change Steam could undo
 
 
 def steam_libraries():
@@ -323,7 +325,10 @@ def diagnose(token):
         wrap = Path(wrapper).name
         configured = steam_launch_options(appid)
         report["launch_set"] = configured is None or wrap in configured
-        if configured is not None and wrap not in configured:
+        report["launch_pending"] = is_pending(appid, KIND_LAUNCH)
+        if not report["launch_set"]:
+            clear_pending(appid, KIND_LAUNCH)   # gone again (Steam reverted us)
+            report["launch_pending"] = False
             merged = with_player_wrapper(configured, wrapper)
             report["notes"].append(
                 "Steam launch options are currently "
@@ -333,6 +338,8 @@ def diagnose(token):
             if merged:
                 def _wrap(appid=appid, value=merged):
                     set_steam_launch_options(appid, value)
+                    if steam_running():
+                        mark_pending(appid, KIND_LAUNCH)
                 todo.append((f"add {wrap} to the game's Steam launch options "
                              "(the Player stub isn't running without it)", _wrap))
                 if steam_running():
@@ -343,6 +350,18 @@ def diagnose(token):
             else:
                 todo.append((f"add this to the game's Steam launch options: "
                              f"{report['launch']}", None))
+        elif report["launch_pending"]:
+            # we wrote it earlier: only trust it once Steam can't rewrite the
+            # file, or we'd report ready on a change Steam is about to drop
+            if steam_running():
+                report["notes"].append(
+                    "the launch option is in place, but Steam is running and "
+                    "rewrites that file when it exits")
+                todo.append(("close Steam, then re-run the doctor so the launch "
+                             "option is kept", None))
+            else:
+                clear_pending(appid, KIND_LAUNCH)
+                report["launch_pending"] = False
     return report, todo
 
 
@@ -379,15 +398,16 @@ def doctor(token, fix):
                 action()
                 fixed += 1
                 print(f"[fixed] {desc}")
-                if "proton-wrap" in desc and steam_running():
-                    print("[!!] Steam was running — close Steam and re-run this "
-                          "(or set it in the game's properties) so it sticks")
             else:
                 print(f"[todo]  {desc}")
         if not fix and any(a for _, a in todo):
             print("\nrun again with --fix to apply the above")
     if fix and fixed:
-        report, _ = diagnose(token)   # so the summary below is post-fix
+        report, todo = diagnose(token)   # show what's left, post-fix
+        if todo:
+            print()
+            for desc, _ in todo:
+                print(f"[todo]  {desc}")
     if report["launch"]:
         state = "" if report.get("launch_set", True) else "   ← not set in Steam"
         print(f"\nSteam launch options (needed when the game doesn't "
@@ -446,8 +466,52 @@ def doctor_all(fix):
 BEPINEX_URL = ("https://github.com/BepInEx/BepInEx/releases/download/"
                "v5.4.23.2/BepInEx_win_x64_5.4.23.2.zip")
 BEPINEX_SHA256 = "f752ce4e838f4c305b9da1404b6745f2cff23b8bfd494f79f0c84d0a01f59b46"
-CACHE_DIR = Path(os.environ.get("XDG_STATE_HOME",
-                                Path.home() / ".local/state")) / "bhaptics-linux" / "cache"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                                Path.home() / ".local/state")) / "bhaptics-linux"
+CACHE_DIR = STATE_DIR / "cache"
+# A change we made to Steam's own config isn't proven until Steam has been
+# restarted: Steam keeps localconfig.vdf in memory and rewrites it on exit.
+PENDING_FILE = STATE_DIR / "doctor-pending.json"
+
+
+def _pending():
+    try:
+        data = json.loads(PENDING_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_pending(data):
+    with contextlib.suppress(OSError):
+        PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PENDING_FILE.with_name(PENDING_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(PENDING_FILE)
+
+
+def mark_pending(appid, kind):
+    """Remember that we changed something Steam can undo, until a run proves
+    it stuck (that's what keeps the doctor from claiming 'ready' too early)."""
+    data = _pending()
+    kinds = data.setdefault(appid, [])
+    if kind not in kinds:
+        kinds.append(kind)
+        _save_pending(data)
+
+
+def clear_pending(appid, kind):
+    data = _pending()
+    kinds = data.get(appid)
+    if kinds and kind in kinds:
+        kinds.remove(kind)
+        if not kinds:
+            data.pop(appid, None)
+        _save_pending(data)
+
+
+def is_pending(appid, kind):
+    return kind in _pending().get(appid, [])
 
 
 def fetch_bepinex():
@@ -548,21 +612,14 @@ def doctor_json(target, fix):
             continue
         if fix:
             errors = []
-            wrapped = False
             for desc, action in todo:
                 if action:
                     try:
                         action()
-                        wrapped = wrapped or "proton-wrap" in desc
                     except Exception as e:
                         errors.append(f"fix failed — {desc}: {e}")
             report, todo = diagnose(appid)
             report["notes"] += errors
-            if wrapped and steam_running():
-                report["notes"].append(
-                    "the launch option was written while Steam was running — "
-                    "close Steam and re-run --fix (or set it in the game's "
-                    "properties) so it sticks")
         out.append(finish_report(report, todo))
     print(json.dumps(out))
 

@@ -163,8 +163,10 @@ into the prefix registry, so **no `WINEDLLOVERRIDES` launch option is
 needed**; most mods also auto-start our fake Player stub, so usually no
 launch options at all. If a mod doesn't, add
 `tools/proton-wrap.sh %command%` — the doctor reads Steam's own config, flags
-the launch option when it isn't set, and `--fix` writes it in for you (close
-Steam first: it rewrites that file on exit). Background: `bhaptics_library.dll`
+the launch option when it isn't set, and `--fix` writes it in for you. Steam
+keeps that file in memory and rewrites it on exit, so a change made while Steam
+is running is only trusted after a run with Steam closed: until then the doctor
+keeps reporting it instead of claiming the game is ready. Background: `bhaptics_library.dll`
 refuses to connect unless it believes the Windows Player is installed and
 running — the doctor fakes the registry entry and drops a stub exe
 (`vestctl proton <appid>` does just that part). Nothing here injects into

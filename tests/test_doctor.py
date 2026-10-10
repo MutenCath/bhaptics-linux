@@ -111,8 +111,13 @@ class SetLaunchOptionsTest(unittest.TestCase):
 
 class VerdictTest(unittest.TestCase):
     def setUp(self):
-        self._orig = vst.steam_libraries
-        self.addCleanup(lambda: setattr(vst, "steam_libraries", self._orig))
+        self._orig = (vst.steam_libraries, vst.steam_running, vst.PENDING_FILE)
+        self.addCleanup(self._restore)
+        vst.PENDING_FILE = Path(tempfile.mkdtemp(prefix="bhaptics-state-")) / "pending.json"
+        vst.steam_running = lambda: False
+
+    def _restore(self):
+        (vst.steam_libraries, vst.steam_running, vst.PENDING_FILE) = self._orig
 
     def diagnose(self, root, fix=False):
         vst.steam_libraries = lambda: [root]
@@ -165,6 +170,45 @@ class VerdictTest(unittest.TestCase):
         self.assertTrue(report["launch_set"])
         self.assertFalse(any("proton-wrap" in m
                              for m in done["issues"] + done["manual"]))
+
+    def test_steam_change_stays_pending_until_steam_restarts(self):
+        root = steam_library(mod=True, launch="VAR=1 %command%")
+        vst.steam_running = lambda: True
+        _, done = self.diagnose(root, fix=True)
+        # written, but Steam will rewrite the file on exit: keep nagging
+        self.assertTrue(any("close Steam" in m for m in done["manual"]))
+        self.assertFalse(done["ok"])
+        self.assertTrue(vst.is_pending(APPID, vst.KIND_LAUNCH))
+
+        vst.steam_running = lambda: False      # confirmed: Steam will read it
+        report, done = self.diagnose(root)
+        self.assertTrue(report["launch_set"])
+        self.assertFalse(report["launch_pending"])
+        self.assertFalse(vst.is_pending(APPID, vst.KIND_LAUNCH))
+        self.assertFalse(any("close Steam" in m
+                             for m in done["issues"] + done["manual"]))
+
+    def test_steam_change_is_not_pending_when_steam_was_closed(self):
+        root = steam_library(mod=True, launch="VAR=1 %command%")
+        report, done = self.diagnose(root, fix=True)
+        self.assertFalse(report["launch_pending"])
+        self.assertFalse(vst.is_pending(APPID, vst.KIND_LAUNCH))
+        self.assertFalse(any("close Steam" in m
+                             for m in done["issues"] + done["manual"]))
+
+    def test_reverted_launch_option_clears_pending_and_reflags(self):
+        root = steam_library(mod=True, launch="VAR=1 %command%")
+        vst.steam_running = lambda: True
+        self.diagnose(root, fix=True)
+        self.assertTrue(vst.is_pending(APPID, vst.KIND_LAUNCH))
+        # Steam wrote its in-memory copy back, dropping our option
+        cfg = next(root.glob("userdata/*/config/localconfig.vdf"))
+        cfg.write_text(f'"apps"\n{{\n\t"{APPID}"\n\t{{\n'
+                       '\t\t"Playtime"\t"7"\n\t}\n}\n')
+        report, done = self.diagnose(root)
+        self.assertFalse(report["launch_set"])
+        self.assertFalse(vst.is_pending(APPID, vst.KIND_LAUNCH))
+        self.assertTrue(any("proton-wrap" in m for m in done["issues"]))
 
     def test_odd_launch_string_falls_back_to_a_manual_step(self):
         root = steam_library(mod=True, launch="-custom -flags")
