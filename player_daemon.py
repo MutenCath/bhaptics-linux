@@ -762,6 +762,11 @@ SDK1_PORT = 15881  # bHaptics Player SDK1 websocket + web UI (fixed by the SDK)
 SDK2_PORT = 15882  # SDK2 wss (fixed by the SDK)
 OSC_PORT = 9001  # VRChat sends avatar parameters here
 DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
+# a proxied game that "looks connected" but never sends anything is the hard
+# case to debug, so note long sessions even when they carry no haptics
+MIN_PROXY_NOTE_SECS = 15
+MSG_TYPE_RE = re.compile(r'"Type"\s*:\s*"([A-Za-z]+)"')
+PLAY_TYPES = ("frame", "raw", "key")  # SDK1 submits; SDK2 is SdkPlay*
 # SDK2 ServerDevices position code -> name (see the SDK's PositionType)
 SDK2_POSITIONS = {0: "Vest", 1: "ForearmL", 2: "ForearmR", 3: "Head"}
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
@@ -1963,12 +1968,16 @@ class PlayerState:
         if scheme == "wss":
             kwargs["ssl"] = sdk2_client_ssl_context()
         self.proxied.add(ws)
+        started = time.monotonic()
+        stats = None
         try:
             async with websockets.connect(uri, **kwargs) as up:
                 self.relay_error = ""
-                await self._pump(ws, up)
+                stats = await self._pump(ws, up)
         finally:
             self.proxied.discard(ws)
+            # a game that connects and stays quiet is the hard case to debug
+            self._log_proxy_summary(scheme, time.monotonic() - started, stats)
 
     async def proxy_sdk1(self, ws):
         await self._proxy(ws, "ws", SDK1_PORT)
@@ -1977,11 +1986,15 @@ class PlayerState:
         await self._proxy(ws, "wss", SDK2_PORT)
 
     async def _pump(self, ws, up):
+        stats = {"msgs": 0, "plays": 0, "types": {}}
+
         async def one(src, dst, from_remote=False):
             try:
                 async for msg in src:
                     if from_remote:
                         self._note_remote_status(msg)
+                    else:
+                        self._count_game_message(msg, stats)
                     await dst.send(msg)
             except Exception as e:
                 log.debug("relay host: proxy stream ended: %s", e)
@@ -1993,6 +2006,37 @@ class PlayerState:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        return stats
+
+    def _count_game_message(self, raw, stats):
+        """Classify a game -> remote message (cheaply: these can be megabytes).
+        Tells a session that never drove the vest from one that did."""
+        stats["msgs"] += 1
+        if not isinstance(raw, str):
+            return
+        m = MSG_TYPE_RE.search(raw[:200])
+        if m is None:
+            return
+        kind = m.group(1)
+        stats["types"][kind] = stats["types"].get(kind, 0) + 1
+        if kind.startswith("SdkPlay") or kind in PLAY_TYPES:
+            stats["plays"] += 1
+            if stats["plays"] == 1:
+                log.info("relay host: the game started sending haptics (%s)", kind)
+
+    @staticmethod
+    def _proxy_summary(scheme, secs, stats):
+        stats = stats or {}
+        kinds = stats.get("types") or {}
+        detail = ", ".join(f"{k} x{n}" for k, n in sorted(kinds.items()))
+        return "%s proxy closed after %.0fs — %d messages, %d haptics%s" % (
+            scheme.upper(), secs, stats.get("msgs", 0), stats.get("plays", 0),
+            f" ({detail})" if detail else "")
+
+    def _log_proxy_summary(self, scheme, secs, stats):
+        line = self._proxy_summary(scheme, secs, stats)
+        (log.info if secs >= MIN_PROXY_NOTE_SECS else log.debug)(
+            "relay host: %s", line)
 
     def _note_remote_status(self, raw):
         """Watch what the remote daemon tells its own client about the vest,

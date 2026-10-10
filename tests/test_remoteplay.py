@@ -122,6 +122,32 @@ class RelayHostTest(IsolatedTestCase):
             "Message": json.dumps([{"position": 0, "connected": False}])}))
         self.assertEqual(st.host_remote_devices, [])
 
+    def test_counts_plays_in_proxied_traffic(self):
+        st = pd.PlayerState(FakeVest())
+        stats = {"msgs": 0, "plays": 0, "types": {}}
+        for payload in ({"Type": "SdkRequestAuth", "Message": "{}"},
+                        {"Type": "SdkPlayDotMode", "Message": "{}"},
+                        {"Type": "SdkPlay", "Message": "{}"},
+                        {"Submit": [{"Type": "frame", "Key": "k"}]}):
+            st._count_game_message(json.dumps(payload), stats)
+        st._count_game_message(b"\x00binary frame", stats)
+        self.assertEqual(stats["msgs"], 5)
+        self.assertEqual(stats["plays"], 3)      # two SdkPlay* plus an SDK1 frame
+        self.assertEqual(stats["types"]["SdkRequestAuth"], 1)
+        self.assertEqual(stats["types"]["frame"], 1)
+
+    def test_proxy_summary_names_the_message_types(self):
+        line = pd.PlayerState._proxy_summary(
+            "wss", 74.4, {"msgs": 132, "plays": 0,
+                          "types": {"SdkPing": 12, "SdkRequestAuth": 1}})
+        self.assertIn("WSS proxy closed after 74s", line)
+        self.assertIn("132 messages, 0 haptics", line)
+        self.assertIn("SdkPing x12", line)
+
+    def test_proxy_summary_survives_no_stats(self):
+        self.assertIn("0 messages, 0 haptics",
+                      pd.PlayerState._proxy_summary("ws", 3.0, None))
+
     def test_remote_status_ignores_unrelated_or_binary_messages(self):
         st = pd.PlayerState(FakeVest())
         st._note_remote_status("not json")
