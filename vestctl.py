@@ -32,6 +32,40 @@ def steam_libraries():
     return out
 
 
+def _steam_app_block(text, appid):
+    """Body of one appid's entry in Steam's localconfig.vdf (brace-matched)."""
+    for m in re.finditer(r'"%s"\s*\{' % re.escape(appid), text):
+        start = text.index("{", m.start())
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
+def steam_launch_options(appid, roots=None):
+    """The game's configured Steam launch options: "" when none are set, or
+    None when we can't tell (no userdata, or the app isn't in there yet)."""
+    if roots is None:
+        roots = [*steam_libraries(), Path.home() / ".steam/steam",
+                 Path.home() / ".local/share/Steam"]
+    for root in roots:
+        for ud in sorted((root / "userdata").glob("*")):
+            cfg = ud / "config" / "localconfig.vdf"
+            if not cfg.exists():
+                continue
+            block = _steam_app_block(cfg.read_text(errors="ignore"), appid)
+            if block is None:
+                continue
+            m = re.search(r'"LaunchOptions"\s*"([^"]*)"', block)
+            return m.group(1) if m else ""
+    return None
+
+
 def find_game(token):
     """Match a Steam game by appid, name substring, or install path.
     Returns (appid, name, gamedir, pfx) or None."""
@@ -124,9 +158,20 @@ def diagnose(token):
     native = not any(gd.rglob("*.exe"))
     report["kind"] = "mod" if mod_dlls else "builtin"
     report["native"] = native
-    report["detected"] = sorted({d.name for d in mod_dlls}) or ["built-in support"]
+    report["detected"] = sorted({d.name for d in mod_dlls}) or ["shipped bHaptics SDK"]
     if native:
         report["notes"].append("native Linux build — no Proton setup needed")
+    if report["kind"] == "builtin":
+        # a DLL inside the game's own assets only proves the game *ships* the
+        # SDK. Some titles that do never call it (Arken Age) and need their
+        # community mod instead — bHaptics lists those as "Mod" support, so
+        # never claim this is ready without a way to check it here.
+        report["notes"].append("the SDK sitting in the game's own files is not "
+                               "proof the game drives the vest; bHaptics lists "
+                               "each title as Native or Mod support (Mod games "
+                               "need their community mod)")
+        todo.append(("shipped SDK only — can't verify the game drives the "
+                     "vest; check its bHaptics Native/Mod support type", None))
 
     report["anticheat"] = has_anticheat(gd)
     if report["anticheat"]:
@@ -209,6 +254,20 @@ def diagnose(token):
                                "cloud-fetched when the game first connects")
 
     report["launch"] = "" if native else f"{tools / 'proton-wrap.sh'} %command%"
+    if report["launch"]:
+        # the emulated Player stub only starts if the game runs under the
+        # wrapper, and that lives in Steam's own config — check what's set
+        wrap = Path(report["launch"].split()[0]).name
+        configured = steam_launch_options(appid)
+        report["launch_set"] = configured is None or wrap in configured
+        if configured is not None and wrap not in configured:
+            report["notes"].append(
+                "Steam launch options are currently "
+                + (f"{configured!r}" if configured else "(none)")
+                + " — games that don't auto-start the emulated Player need "
+                  f"{wrap} there")
+            todo.append((f"add {wrap} to the game's Steam launch options "
+                         "(the Player stub isn't running without it)", None))
     return report, todo
 
 
@@ -230,7 +289,8 @@ def doctor(token, fix):
     if report["kind"] == "mod":
         print(f"[ok] bhaptics mod detected: {', '.join(report['detected'])}")
     else:
-        print("[ok] built-in bhaptics support detected (ships with the game)")
+        print("[--] the game ships the bHaptics SDK — that alone doesn't prove "
+              "it drives the vest")
     for note in report["notes"]:
         print(f"[--] {note}")
 
@@ -249,8 +309,9 @@ def doctor(token, fix):
         if not fix and any(a for _, a in todo):
             print("\nrun again with --fix to apply the above")
     if report["launch"]:
-        print(f"\noptional Steam launch options (only if the mod doesn't "
-              f"auto-start the Player):\n  {report['launch']}")
+        state = "" if report.get("launch_set", True) else "   ← not set in Steam"
+        print(f"\nSteam launch options (needed when the game doesn't "
+              f"auto-start the Player):\n  {report['launch']}{state}")
     return fixed
 
 

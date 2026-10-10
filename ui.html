@@ -1263,7 +1263,7 @@ function renderGames() {
     name.className = "gname"; name.textContent = g.name;
     const chip = document.createElement("span");
     chip.className = "kchip" + (g.kind === "mod" ? " mod" : "");
-    chip.textContent = g.kind === "mod" ? "mod" : (g.native ? "native · built-in" : "built-in");
+    chip.textContent = g.kind === "mod" ? "mod" : (g.native ? "native build" : "built-in SDK");
     const stat = document.createElement("span");
     const bits = [...(g.issues || []), ...(g.manual || [])];
     if (g.anticheat) {
@@ -1280,7 +1280,9 @@ function renderGames() {
       b.onclick = () => doctorFix(g.appid);
       row.appendChild(b);
     }
-    if (g.launch) row.title = "optional launch options: " + g.launch;
+    if (g.launch) row.title = (g.launch_set === false
+      ? "launch options missing — add: "
+      : "launch options (if the Player stub isn't auto-started): ") + g.launch;
     box.appendChild(row);
   }
 }

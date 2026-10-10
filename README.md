@@ -154,14 +154,18 @@ The **🩺 Detect games** button in the UI lists every installed game with
 bhaptics support and its patch status — ✓ ready, or what's missing — with a
 per-game **Fix** button, so nothing touches a game folder without you
 clicking it. It distinguishes mods from built-in bhaptics support (many VR
-titles ship the SDK) and native Linux builds (which need nothing). Loader DLL overrides
+titles ship the SDK) and native Linux builds (which need nothing). A game that
+merely *ships* the SDK is not called ready: several titles ship it and never
+call it (Arken Age does — bHaptics lists it as **Mod** support, so it needs its
+community mod), and the doctor says so instead of guessing. Loader DLL overrides
 (BepInEx→winhttp, ASI→winmm, MelonLoader→version, UE4SS→dwmapi) are baked
 into the prefix registry, so **no `WINEDLLOVERRIDES` launch option is
 needed**; most mods also auto-start our fake Player stub, so usually no
 launch options at all. If a mod doesn't, add
-`tools/proton-wrap.sh %command%`. Background: `bhaptics_library.dll` refuses
-to connect unless it believes the Windows Player is installed and running —
-the doctor fakes the registry entry and drops a stub exe
+`tools/proton-wrap.sh %command%` — the doctor reads Steam's own config and
+flags the launch option when it isn't set. Background: `bhaptics_library.dll`
+refuses to connect unless it believes the Windows Player is installed and
+running — the doctor fakes the registry entry and drops a stub exe
 (`vestctl proton <appid>` does just that part). Nothing here injects into
 game processes; doctor only places mod files and writes prefix registry
 keys — and it refuses to touch any game containing EasyAntiCheat/BattlEye.
