@@ -162,8 +162,9 @@ community mod), and the doctor says so instead of guessing. Loader DLL overrides
 into the prefix registry, so **no `WINEDLLOVERRIDES` launch option is
 needed**; most mods also auto-start our fake Player stub, so usually no
 launch options at all. If a mod doesn't, add
-`tools/proton-wrap.sh %command%` — the doctor reads Steam's own config and
-flags the launch option when it isn't set. Background: `bhaptics_library.dll`
+`tools/proton-wrap.sh %command%` — the doctor reads Steam's own config, flags
+the launch option when it isn't set, and `--fix` writes it in for you (close
+Steam first: it rewrites that file on exit). Background: `bhaptics_library.dll`
 refuses to connect unless it believes the Windows Player is installed and
 running — the doctor fakes the registry entry and drops a stub exe
 (`vestctl proton <appid>` does just that part). Nothing here injects into

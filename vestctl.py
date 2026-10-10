@@ -32,8 +32,8 @@ def steam_libraries():
     return out
 
 
-def _steam_app_block(text, appid):
-    """Body of one appid's entry in Steam's localconfig.vdf (brace-matched)."""
+def _steam_app_span(text, appid):
+    """(start, end) of one appid's entry in Steam's localconfig.vdf."""
     for m in re.finditer(r'"%s"\s*\{' % re.escape(appid), text):
         start = text.index("{", m.start())
         depth = 0
@@ -43,27 +43,89 @@ def _steam_app_block(text, appid):
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[start:i + 1]
+                    return start, i + 1
     return None
 
 
-def steam_launch_options(appid, roots=None):
-    """The game's configured Steam launch options: "" when none are set, or
-    None when we can't tell (no userdata, or the app isn't in there yet)."""
+def _steam_app_block(text, appid):
+    """Body of one appid's entry in Steam's localconfig.vdf (brace-matched)."""
+    span = _steam_app_span(text, appid)
+    return text[span[0]:span[1]] if span else None
+
+
+def _steam_userdata_configs(roots=None):
     if roots is None:
         roots = [*steam_libraries(), Path.home() / ".steam/steam",
                  Path.home() / ".local/share/Steam"]
     for root in roots:
         for ud in sorted((root / "userdata").glob("*")):
             cfg = ud / "config" / "localconfig.vdf"
-            if not cfg.exists():
-                continue
-            block = _steam_app_block(cfg.read_text(errors="ignore"), appid)
-            if block is None:
-                continue
-            m = re.search(r'"LaunchOptions"\s*"([^"]*)"', block)
-            return m.group(1) if m else ""
+            if cfg.exists():
+                yield cfg
+
+
+def steam_launch_options(appid, roots=None):
+    """The game's configured Steam launch options: "" when none are set, or
+    None when we can't tell (no userdata, or the app isn't in there yet)."""
+    for cfg in _steam_userdata_configs(roots):
+        block = _steam_app_block(cfg.read_text(errors="ignore"), appid)
+        if block is None:
+            continue
+        m = re.search(r'"LaunchOptions"\s*"([^"]*)"', block)
+        return m.group(1) if m else ""
     return None
+
+
+def with_player_wrapper(options, wrapper):
+    """Put `wrapper` just before %command%, keeping the env assignments and
+    trailing arguments the game already has. None when there's no %command%
+    to anchor to (a string we shouldn't guess at)."""
+    opts = options.strip()
+    if not opts:
+        return f"{wrapper} %command%"
+    if "%command%" not in opts:
+        return None
+    head, _, tail = opts.partition("%command%")
+    head = head.strip()
+    return (f"{head} " if head else "") + wrapper + " %command%" + tail
+
+
+def set_steam_launch_options(appid, value, roots=None):
+    """Write one app's LaunchOptions into Steam's localconfig.vdf (atomics,
+    first copy kept as a .bhaptics-bak). Returns the file, or None."""
+    for cfg in _steam_userdata_configs(roots):
+        text = cfg.read_text(errors="ignore")
+        span = _steam_app_span(text, appid)
+        if span is None:
+            continue
+        start, end = span
+        body = text[start:end]
+        m = re.search(r'("LaunchOptions"\s*)("[^"]*")', body)
+        if m:
+            body = body[:m.start(2)] + json.dumps(value) + body[m.end(2):]
+        else:  # no key yet: add one just inside the block
+            body = body.replace("{", '{\n\t\t\t\t\t\t"LaunchOptions"\t\t'
+                                     + json.dumps(value), 1)
+        backup = cfg.with_name(cfg.name + ".bhaptics-bak")
+        if not backup.exists():
+            backup.write_text(text)
+        tmp = cfg.with_name(cfg.name + ".tmp")
+        tmp.write_text(text[:start] + body + text[end:])
+        tmp.replace(cfg)
+        return str(cfg)
+    return None
+
+
+def steam_running():
+    """Is Steam up? It rewrites localconfig.vdf from memory, so a launch-option
+    edit only sticks once Steam is restarted."""
+    for p in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if p.read_text(errors="ignore").strip().startswith("steam"):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def find_game(token):
@@ -257,17 +319,30 @@ def diagnose(token):
     if report["launch"]:
         # the emulated Player stub only starts if the game runs under the
         # wrapper, and that lives in Steam's own config — check what's set
-        wrap = Path(report["launch"].split()[0]).name
+        wrapper = report["launch"].split()[0]
+        wrap = Path(wrapper).name
         configured = steam_launch_options(appid)
         report["launch_set"] = configured is None or wrap in configured
         if configured is not None and wrap not in configured:
+            merged = with_player_wrapper(configured, wrapper)
             report["notes"].append(
                 "Steam launch options are currently "
                 + (f"{configured!r}" if configured else "(none)")
                 + " — games that don't auto-start the emulated Player need "
                   f"{wrap} there")
-            todo.append((f"add {wrap} to the game's Steam launch options "
-                         "(the Player stub isn't running without it)", None))
+            if merged:
+                def _wrap(appid=appid, value=merged):
+                    set_steam_launch_options(appid, value)
+                todo.append((f"add {wrap} to the game's Steam launch options "
+                             "(the Player stub isn't running without it)", _wrap))
+                if steam_running():
+                    report["notes"].append(
+                        "Steam is running and rewrites this file when it exits — "
+                        "close Steam before applying, or the launch option can "
+                        "be reverted")
+            else:
+                todo.append((f"add this to the game's Steam launch options: "
+                             f"{report['launch']}", None))
     return report, todo
 
 
@@ -304,10 +379,15 @@ def doctor(token, fix):
                 action()
                 fixed += 1
                 print(f"[fixed] {desc}")
+                if "proton-wrap" in desc and steam_running():
+                    print("[!!] Steam was running — close Steam and re-run this "
+                          "(or set it in the game's properties) so it sticks")
             else:
                 print(f"[todo]  {desc}")
         if not fix and any(a for _, a in todo):
             print("\nrun again with --fix to apply the above")
+    if fix and fixed:
+        report, _ = diagnose(token)   # so the summary below is post-fix
     if report["launch"]:
         state = "" if report.get("launch_set", True) else "   ← not set in Steam"
         print(f"\nSteam launch options (needed when the game doesn't "
@@ -468,14 +548,21 @@ def doctor_json(target, fix):
             continue
         if fix:
             errors = []
+            wrapped = False
             for desc, action in todo:
                 if action:
                     try:
                         action()
+                        wrapped = wrapped or "proton-wrap" in desc
                     except Exception as e:
                         errors.append(f"fix failed — {desc}: {e}")
             report, todo = diagnose(appid)
             report["notes"] += errors
+            if wrapped and steam_running():
+                report["notes"].append(
+                    "the launch option was written while Steam was running — "
+                    "close Steam and re-run --fix (or set it in the game's "
+                    "properties) so it sticks")
         out.append(finish_report(report, todo))
     print(json.dumps(out))
 
