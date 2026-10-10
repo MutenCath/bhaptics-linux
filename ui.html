@@ -537,6 +537,11 @@
           elsewhere; it finds that device on the LAN automatically (turn on Accept there). Hosting
           releases this device's own vest link and shows whether the remote device really has a
           vest connected.</div>
+        <label class="tog" style="margin-top:10px"><span class="switch"><input type="checkbox"
+          id="reportvest" onchange="send({ReportVest: this.checked})"><i></i></span>
+          always tell games a vest is connected — some native titles refuse to send haptics
+          unless their device list has one (turn this on when the vest is on another device and
+          the game still says it can't find it)</label>
         <div class="statustext" style="color:var(--bad); margin-top:6px" id="rperr"></div>
       </div>
     </div>
@@ -708,6 +713,7 @@ function connect() {
       document.getElementById("rpmode").value =
         msg.RelayHost ? "host" : (msg.RemotePlay ? "accept" : "off");
     }
+    if ("ReportVest" in msg) document.getElementById("reportvest").checked = !!msg.ReportVest;
     let rpnote = "", rperr = msg.RelayHostError || "";
     if (msg.RelayHost && msg.RelayHostRemote) {
       const dev = msg.RelayHostDevices || [];

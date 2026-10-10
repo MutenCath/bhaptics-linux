@@ -168,3 +168,59 @@ class RelayHostTest(IsolatedTestCase):
         self.assertTrue(pd._is_local_ip("127.0.0.1"))
         self.assertTrue(pd._is_local_ip("localhost"))
         self.assertFalse(pd._is_local_ip("203.0.113.9"))
+
+
+class ReportVestTest(IsolatedTestCase):
+    """Opt-in: tell *game* clients a vest is connected when we have none.
+
+    Some native titles gate every effect on their device list; with the vest
+    behind Remote Play that list would otherwise be empty. Our own UI must
+    keep seeing the truth.
+    """
+
+    class FakeWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, msg):
+            self.sent.append(json.loads(msg))
+
+    def devices(self, st):
+        ws = self.FakeWS()
+        asyncio.run(st.handle_sdk2(
+            ws, {"Type": "SdkRequestAuthInit", "Message": "{}"}, "", ""))
+        msg = next(m for m in ws.sent if m["Type"] == "ServerDevices")
+        return json.loads(msg["Message"])[0]
+
+    def test_truthful_by_default(self):
+        st = pd.PlayerState(FakeVest())
+        self.assertFalse(self.devices(st)["connected"])
+        self.assertEqual(json.loads(st.status_message())["ConnectedDeviceCount"], 0)
+
+    def test_opt_in_reports_a_vest_to_games_only(self):
+        st = pd.PlayerState(FakeVest())
+        asyncio.run(st.handle({"ReportVest": True}))
+        self.assertTrue(self.devices(st)["connected"])
+        self.assertEqual(json.loads(st.status_message())["ConnectedDeviceCount"], 0)
+        self.assertEqual(
+            json.loads(st.status_message(for_game=True))["ConnectedDeviceCount"], 1)
+
+    def test_setting_persists(self):
+        st = pd.PlayerState(FakeVest())
+        asyncio.run(st.handle({"ReportVest": True}))
+        self.assertTrue(pd.report_vest_always())
+        self.assertTrue(pd.PlayerState(FakeVest()).report_vest)
+
+    def test_device_record_carries_the_real_address_and_battery(self):
+        class Vest:
+            connected = True
+            idle = False
+            battery = 42
+            address = "E1:10:52:47:A4:12"
+
+            def mark_active(self):
+                pass
+
+        dev = self.devices(pd.PlayerState(Vest()))
+        self.assertEqual(dev["address"], "E1:10:52:47:A4:12")
+        self.assertEqual(dev["battery"], 42)

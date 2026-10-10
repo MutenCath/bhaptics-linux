@@ -227,6 +227,15 @@ the vest**: with the relay that's the vest device, and with Host mode the remote
 one, so import `.tact` files there (`vestctl import` on the gaming PC only
 affects the local daemon).
 
+Some native titles gate every effect on their device list and refuse to send
+anything until it has a vest in it (Dungeons of Eternity is one). When the vest
+sits on another device that list is filled from the remote, but if a game still
+says it can't find your vest, the **always tell games a vest is connected**
+switch in the UI (or `{"report_vest": true}` in `network.json`) makes the
+emulated Player answer that question with a vest anyway. It only changes what
+games are told — the UI, `vestctl status` and the audio engine keep showing the
+truth — and it is off by default.
+
 VRChat needs no relay: point its OSC output straight at the daemon with the
 launch option `--osc=9000:<vest-device-ip>:9001`.
 

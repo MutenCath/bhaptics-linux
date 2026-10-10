@@ -131,6 +131,22 @@ def set_relay_host(enabled):
     _save_network(cfg)
 
 
+def report_vest_always():
+    """Tell SDK clients a vest is connected even when this daemon has none.
+
+    Some native titles gate every effect on the device list (Dungeons of
+    Eternity), and when the vest lives on another device behind Remote Play
+    there is nothing else to satisfy that check with.
+    """
+    return bool(_load_network().get("report_vest"))
+
+
+def set_report_vest(enabled):
+    cfg = _load_network()
+    cfg["report_vest"] = bool(enabled)
+    _save_network(cfg)
+
+
 def _is_local_ip(ip):
     if ip in ("127.0.0.1", "::1", "localhost"):
         return True
@@ -616,6 +632,12 @@ class VestLink:
     @property
     def connected(self):
         return self.client is not None and self.client.is_connected
+
+    @property
+    def address(self):
+        """The vest's BLE address, so a game's device record looks like the
+        real Player's instead of carrying an empty string."""
+        return (getattr(self.client, "address", "") or "") if self.client else ""
 
     def mark_active(self):
         """Haptics are being produced: keep/return the vest awake."""
@@ -1723,6 +1745,7 @@ class PlayerState:
         self.relay_error = ""
         self.host_remote_devices = []   # vest state reported by the remote daemon
         self.host_remote_battery = None
+        self.report_vest = report_vest_always()  # lie about the vest? (opt-in)
         self.proxied = set()
         self._finder = None
         self._config_failed = False
@@ -1826,13 +1849,14 @@ class PlayerState:
             log.warning("audio source listing failed: %s", e)
         return out
 
-    def status_message(self):
+    def status_message(self, for_game=False):
+        vest_on = self.vest.connected or (for_game and self.report_vest)
         return json.dumps(
             {
                 "RegisteredKeys": list(self.registered.keys()),
                 "ActiveKeys": list(self.active.keys()),
-                "ConnectedDeviceCount": 1 if self.vest.connected else 0,
-                "ConnectedPositions": ["Vest"] if self.vest.connected else [],
+                "ConnectedDeviceCount": 1 if vest_on else 0,
+                "ConnectedPositions": ["Vest"] if vest_on else [],
                 "VestIdle": bool(self.vest.idle),
                 "RemotePlay": remote_play_enabled(),
                 "RelayHost": self.relay_host,
@@ -1840,6 +1864,7 @@ class PlayerState:
                 "RelayHostError": self.relay_error,
                 "RelayHostDevices": self.host_remote_devices,
                 "RelayHostBattery": self.host_remote_battery,
+                "ReportVest": self.report_vest,
                 "Mapping": self.mapping.as_dict(),
                 "Feel": self.feel.as_dict(),
                 "AudioMode": self.audio.enabled,
@@ -2186,6 +2211,13 @@ class PlayerState:
             else:
                 self.stop_relay_host()
 
+        if "ReportVest" in payload:
+            # some native titles gate every effect on the device list; when the
+            # vest lives on another device that list would otherwise be empty
+            self.report_vest = bool(payload["ReportVest"])
+            set_report_vest(self.report_vest)
+            log.info("report a connected vest to game clients: %s", self.report_vest)
+
         if (payload.get("SurroundTest")
                 and (self._surtest is None or self._surtest.done())):
             self._surtest = asyncio.create_task(self.surround_test())
@@ -2385,8 +2417,10 @@ class PlayerState:
         async def send_devices():
             dev = {
                 "position": 0, "deviceName": "TactSuitPro",
-                "address": "", "connected": self.vest.connected,
-                "battery": 100, "audioJackIn": False, "paired": True, "vsm": 0,
+                "address": getattr(self.vest, "address", "") or "",
+                "connected": self.vest.connected or self.report_vest,
+                "battery": self.vest.battery if self.vest.battery is not None else 100,
+                "audioJackIn": False, "paired": True, "vsm": 0,
             }
             await reply("ServerDevices", [dev])
 
@@ -2790,19 +2824,28 @@ class PlayerState:
             await asyncio.sleep(0.05)
 
     async def status_loop(self):
-        last = None
+        last = {}
         saved_audio = self.persisted_settings()
         last_conn = None
         last_sup = None
         sup_since = None
         paused_notice = float("-inf")
         while True:
-            msg = self.status_message()
-            if msg != last and self.clients:
+            if self.clients:
+                plain = self.status_message()
+                fake = self.status_message(for_game=True) if self.report_vest else plain
                 for ws in list(self.clients):
+                    # game clients may be told a vest is present (opt-in) while
+                    # our own UI always gets the truth
+                    msg = fake if ws in self.game_clients else plain
+                    if last.get(ws) == msg:
+                        continue
                     with contextlib.suppress(Exception):
                         await ws.send(msg)
-                last = msg
+                        last[ws] = msg
+                for ws in list(last):
+                    if ws not in self.clients:
+                        last.pop(ws, None)
             cur = self.persisted_settings()
             if cur != saved_audio:
                 with contextlib.suppress(OSError):
@@ -2868,7 +2911,7 @@ async def ws_handler(ws, state):
         log.info("game client connected: %s (audio yields while it sends patterns)",
                  app_name or app_id or "unnamed client")
     try:
-        await ws.send(state.status_message())
+        await ws.send(state.status_message(for_game=is_game))
         async for raw in ws:
             try:
                 payload = json.loads(raw)
@@ -2925,7 +2968,7 @@ async def ws_handler(ws, state):
                 continue
             if "ImportTact" in payload:
                 await ws.send(json.dumps({"ImportNote": state.import_note}))
-            await ws.send(state.status_message())
+            await ws.send(state.status_message(for_game=is_game))
     except websockets.ConnectionClosed:
         pass
     finally:
