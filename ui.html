@@ -534,7 +534,9 @@
         <div class="hint" style="margin:8px 0 0"><b>Accept</b> binds the Player on this device's LAN
           so a game on another PC can reach it — run <code>tools/remote-relay.py</code> there and it
           finds this device automatically. <b>Host</b> forwards this device's games to a vest device
-          elsewhere; it finds that device on the LAN automatically (turn on Accept there).</div>
+          elsewhere; it finds that device on the LAN automatically (turn on Accept there). Hosting
+          releases this device's own vest link and shows whether the remote device really has a
+          vest connected.</div>
         <div class="statustext" style="color:var(--bad); margin-top:6px" id="rperr"></div>
       </div>
     </div>
@@ -706,9 +708,15 @@ function connect() {
       document.getElementById("rpmode").value =
         msg.RelayHost ? "host" : (msg.RemotePlay ? "accept" : "off");
     }
-    document.getElementById("rperr").textContent =
-      msg.RelayHostError || (msg.RelayHost && msg.RelayHostRemote
-        ? "forwarding to " + msg.RelayHostRemote : "");
+    let rpnote = "", rperr = msg.RelayHostError || "";
+    if (msg.RelayHost && msg.RelayHostRemote) {
+      const dev = msg.RelayHostDevices || [];
+      rpnote = "forwarding to " + msg.RelayHostRemote + (dev.length
+        ? " · vest ready" + (msg.RelayHostBattery != null ? " (" + msg.RelayHostBattery + "%)" : "")
+        : " · no vest on the remote yet");
+    }
+    document.getElementById("rperr").textContent = rperr || rpnote;
+    document.getElementById("rperr").style.color = rperr ? "var(--bad)" : "var(--dim)";
     document.getElementById("padinfo").textContent =
       (msg.PadDevices || []).length ? "🎮 " + msg.PadDevices.join(", ") : "";
     document.getElementById("autoinfo").textContent =

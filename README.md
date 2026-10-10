@@ -206,6 +206,20 @@ tools/remote-relay.py --list      # show what's on the LAN
 tools/remote-relay.py --host <ip> # fallback when broadcast can't cross (VLANs)
 ```
 
+Alternatively the gaming PC's own daemon can host: pick **Host haptics** in the
+web UI (or write `{"relay_host": true}` to `~/.config/bhaptics-linux/network.json`)
+and it forwards the games on that machine to the vest device, which only needs
+**Accept**. Hosting releases that machine's own BLE link—the vest allows a single
+connection, so the two daemons must not both hold it—and the UI shows whether the
+remote device actually has a vest connected. Turn Host **on before launching** the
+game: switching mid-session drops the game's connection and relies on its SDK
+client reconnecting, which Source mods and some Unity titles don't do.
+
+Whichever route you take, patterns and settings live on the **daemon that owns
+the vest**: with the relay that's the vest device, and with Host mode the remote
+one, so import `.tact` files there (`vestctl import` on the gaming PC only
+affects the local daemon).
+
 VRChat needs no relay: point its OSC output straight at the daemon with the
 launch option `--osc=9000:<vest-device-ip>:9001`.
 

@@ -1,4 +1,5 @@
 """Remote Play toggle: the persisted LAN-bind setting and the host forwarder."""
+import asyncio
 import json
 from unittest import mock
 
@@ -69,12 +70,66 @@ class RelayHostTest(IsolatedTestCase):
         self.assertEqual(st.relay_error, "")
         self.assertFalse(pd.relay_host_from_config())
 
+    def test_shutdown_stop_keeps_host_mode_configured(self):
+        pd.set_relay_host(True)
+        st = pd.PlayerState(FakeVest())
+        st.relay_host = True
+        st.stop_relay_host(persist=False)      # what daemon shutdown does
+        self.assertFalse(st.relay_host)
+        self.assertTrue(pd.relay_host_from_config())   # restored next start
+
     def test_status_exposes_relay_keys(self):
         st = pd.PlayerState(FakeVest())
         msg = json.loads(st.status_message())
         self.assertIn("RelayHost", msg)
         self.assertIn("RelayHostRemote", msg)
         self.assertIn("RelayHostError", msg)
+        self.assertIn("RelayHostDevices", msg)
+        self.assertIn("RelayHostBattery", msg)
+
+    def test_host_mode_releases_the_local_vest_link(self):
+        vest = FakeVest()
+        st = pd.PlayerState(vest)
+
+        async def go():
+            st.start_relay_host()           # needs a loop: it starts the finder
+            self.assertTrue(vest.host_mode)
+            st.stop_relay_host()
+            self.assertFalse(vest.host_mode)
+        asyncio.run(go())
+
+    def test_remote_device_state_from_sdk1_status(self):
+        st = pd.PlayerState(FakeVest())
+        st._note_remote_status(json.dumps(
+            {"ConnectedDeviceCount": 1, "ConnectedPositions": ["Vest"], "Battery": 88}))
+        self.assertEqual(st.host_remote_devices, ["Vest"])
+        self.assertEqual(st.host_remote_battery, 88)
+        st._note_remote_status(json.dumps(
+            {"ConnectedDeviceCount": 0, "ConnectedPositions": []}))
+        self.assertEqual(st.host_remote_devices, [])
+        self.assertIsNone(st.host_remote_battery)
+
+    def test_remote_device_state_from_sdk2_serverdevices(self):
+        st = pd.PlayerState(FakeVest())
+        st._note_remote_status(json.dumps({
+            "Type": "ServerDevices",
+            "Message": json.dumps([{"position": 0, "deviceName": "TactSuitPro",
+                                    "connected": True, "battery": 55}])}))
+        self.assertEqual(st.host_remote_devices, ["Vest"])
+        self.assertEqual(st.host_remote_battery, 55)
+        st._note_remote_status(json.dumps({
+            "Type": "ServerDevices",
+            "Message": json.dumps([{"position": 0, "connected": False}])}))
+        self.assertEqual(st.host_remote_devices, [])
+
+    def test_remote_status_ignores_unrelated_or_binary_messages(self):
+        st = pd.PlayerState(FakeVest())
+        st._note_remote_status("not json")
+        st._note_remote_status(b"\x00\x01\x02")          # binary frame
+        st._note_remote_status(json.dumps({"Type": "ServerReady", "Message": ""}))
+        st._note_remote_status(json.dumps({"big": "x" * 100}))  # no status keys
+        self.assertEqual(st.host_remote_devices, [])
+        self.assertIsNone(st.host_remote_battery)
 
     def test_remote_host_from_config(self):
         pd.NETWORK_FILE.write_text('{"remote": "10.0.0.7"}')

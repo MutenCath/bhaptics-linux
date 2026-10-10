@@ -48,6 +48,7 @@ class FakeVest:
         self.connected = False
         self.battery = None
         self.idle = False
+        self.host_mode = False
 
     def mark_active(self):
         pass

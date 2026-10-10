@@ -1,8 +1,9 @@
 """Protocol / compile-path tests: frames, raw submits, .tact projects, mapping."""
+import asyncio
 import unittest
 
 import player_daemon as pd
-from tests.base import IsolatedTestCase
+from tests.base import FakeVest, IsolatedTestCase
 
 
 class HelpersTest(unittest.TestCase):
@@ -83,6 +84,36 @@ class MappingTest(IsolatedTestCase):
         m = pd.VestMapping()
         with self.assertRaises(ValueError):
             m.set([0] * 19, [0] * 20, save=False)
+
+
+class ImportTactTest(IsolatedTestCase):
+    """A single .tact registers under the name the caller gave, not the
+    author's internal project name — HL2 VR ships ShootAR2_L.tact whose
+    project is called Recoil_LV3_Mirror, and mods ask for it by file name."""
+
+    def imported(self, name, project):
+        st = pd.PlayerState(FakeVest())
+        asyncio.run(st.handle({"ImportTact": {"name": name, "project": project}}))
+        return st
+
+    def test_tact_container_is_named_by_the_request(self):
+        project = {"name": "Recoil_LV3_Mirror", "tracks": [{"effects": []}]}
+        st = self.imported("ShootAR2_L", {"durationMillis": 100, "size": 100,
+                                          "project": project})
+        self.assertIn("ShootAR2_L", st.patterns)
+        self.assertNotIn("Recoil_LV3_Mirror", st.patterns)
+
+    def test_bare_project_is_named_by_the_request(self):
+        st = self.imported("HitByBullet", {"name": "Impact1_weak", "tracks": []})
+        self.assertIn("HitByBullet", st.patterns)
+        self.assertNotIn("Impact1_weak", st.patterns)
+
+    def test_manifest_still_uses_its_event_names(self):
+        manifest = [{"key": "death", "tracks": []}, {"key": "hit", "tracks": []}]
+        st = self.imported("mod-manifest", manifest)
+        self.assertIn("death", st.patterns)
+        self.assertIn("hit", st.patterns)
+        self.assertNotIn("mod-manifest", st.patterns)
 
 
 if __name__ == "__main__":

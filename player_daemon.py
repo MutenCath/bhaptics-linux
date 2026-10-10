@@ -609,6 +609,7 @@ class VestLink:
         self.battery = None
         self.last_active = time.monotonic()
         self.idle = False  # slept after IDLE_DISCONNECT_SECS idle to save battery
+        self.host_mode = False  # Remote Play Host: the vest is on the remote device
         self._batt_tick = 0
         self._absent_scans = 0  # while asleep: scans in a row that missed the vest
 
@@ -623,16 +624,22 @@ class VestLink:
             self.idle = False
             log.info("vest wake: activity resumed, reconnecting")
 
+    async def _close(self):
+        """Drop the BLE link, motors off first so nothing keeps buzzing."""
+        dead, self.client = self.client, None
+        self.last_sent = None
+        if dead is None:
+            return
+        with contextlib.suppress(Exception):
+            await dead.write_gatt_char(MOTOR_STABLE, bytes(20), response=False)
+            await dead.disconnect()
+
     async def _sleep_vest(self):
         log.info("vest idle for %d min — disconnecting to save the battery",
                  IDLE_DISCONNECT_SECS // 60)
         self.idle = True
         self._absent_scans = 0
-        dead, self.client = self.client, None
-        self.last_sent = None
-        with contextlib.suppress(Exception):
-            await dead.write_gatt_char(MOTOR_STABLE, bytes(20), response=False)
-            await dead.disconnect()
+        await self._close()
 
     @staticmethod
     async def _find(timeout):
@@ -662,6 +669,18 @@ class VestLink:
 
     async def maintain(self):
         while True:
+            if self.host_mode:
+                # Remote Play Host: the vest lives on the remote device we
+                # forward to. Don't scan or connect here — the vest allows one
+                # BLE connection, and a local link would just steal it from the
+                # daemon that actually owns it.
+                if self.client is not None:
+                    log.info("relay host: releasing the local vest link")
+                    self.battery = None
+                    self.idle = False
+                    await self._close()
+                await asyncio.sleep(1)
+                continue
             if not self.connected:
                 if self.idle:
                     await self._watch_while_asleep()
@@ -743,6 +762,8 @@ SDK1_PORT = 15881  # bHaptics Player SDK1 websocket + web UI (fixed by the SDK)
 SDK2_PORT = 15882  # SDK2 wss (fixed by the SDK)
 OSC_PORT = 9001  # VRChat sends avatar parameters here
 DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
+# SDK2 ServerDevices position code -> name (see the SDK's PositionType)
+SDK2_POSITIONS = {0: "Vest", 1: "ForearmL", 2: "ForearmR", 3: "Head"}
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
 GAME_ACTIVE_WINDOW = 8.0  # s: while a game sends patterns, audio mode yields
 IDLE_DISCONNECT_SECS = 900  # s: sleep the vest after this long with no haptics
@@ -1695,6 +1716,8 @@ class PlayerState:
         self.relay_host = False
         self.host_remote = ""
         self.relay_error = ""
+        self.host_remote_devices = []   # vest state reported by the remote daemon
+        self.host_remote_battery = None
         self.proxied = set()
         self._finder = None
         self._config_failed = False
@@ -1810,6 +1833,8 @@ class PlayerState:
                 "RelayHost": self.relay_host,
                 "RelayHostRemote": self.host_remote,
                 "RelayHostError": self.relay_error,
+                "RelayHostDevices": self.host_remote_devices,
+                "RelayHostBattery": self.host_remote_battery,
                 "Mapping": self.mapping.as_dict(),
                 "Feel": self.feel.as_dict(),
                 "AudioMode": self.audio.enabled,
@@ -1860,7 +1885,10 @@ class PlayerState:
         self.relay_host = True
         self.host_remote = ""
         self.relay_error = ""
+        self.host_remote_devices = []
+        self.host_remote_battery = None
         self._config_failed = False
+        self.vest.host_mode = True  # stop owning a local BLE link while hosting
         set_relay_host(True)
         self._restart_finder()
         self._drop_game_clients()
@@ -1902,16 +1930,23 @@ class PlayerState:
             await asyncio.sleep(0.1)
         return bool(self.host_remote)
 
-    def stop_relay_host(self):
+    def stop_relay_host(self, persist=True):
+        """Stop hosting. `persist=False` is for daemon shutdown: the user's
+        choice must survive a restart, so only an explicit UI/CLI stop writes
+        the config back to off."""
         self.relay_host = False
         self.host_remote = ""
         self.relay_error = ""
+        self.host_remote_devices = []
+        self.host_remote_battery = None
+        self.vest.host_mode = False
         self._config_failed = False
         if self._finder is not None and not self._finder.done():
             self._finder.cancel()
         for ws in list(self.proxied):
             self._bg(ws.close())
-        set_relay_host(False)
+        if persist:
+            set_relay_host(False)
 
     def _proxy_failed(self, exc):
         self.relay_error = str(exc)
@@ -1941,21 +1976,63 @@ class PlayerState:
     async def proxy_sdk2(self, ws):
         await self._proxy(ws, "wss", SDK2_PORT)
 
-    @staticmethod
-    async def _pump(a, b):
-        async def one(src, dst):
+    async def _pump(self, ws, up):
+        async def one(src, dst, from_remote=False):
             try:
                 async for msg in src:
+                    if from_remote:
+                        self._note_remote_status(msg)
                     await dst.send(msg)
             except Exception as e:
                 log.debug("relay host: proxy stream ended: %s", e)
-        tasks = [asyncio.create_task(one(a, b)), asyncio.create_task(one(b, a))]
+        tasks = [asyncio.create_task(one(ws, up)),
+                 asyncio.create_task(one(up, ws, from_remote=True))]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _note_remote_status(self, raw):
+        """Watch what the remote daemon tells its own client about the vest,
+        so the Host UI can say whether the remote actually has one connected.
+        Runs per proxied message, hence the cheap substring gate first."""
+        if not isinstance(raw, str) or (
+                "ConnectedPositions" not in raw and "ServerDevices" not in raw):
+            return
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(msg, dict):
+            return
+        if "ConnectedPositions" in msg or "ConnectedDeviceCount" in msg:
+            # SDK1: the remote's own status message
+            connected = int(msg.get("ConnectedDeviceCount") or 0) > 0
+            positions = list(msg.get("ConnectedPositions") or []) if connected else []
+            self._set_remote_devices(positions, msg.get("Battery"))
+        elif msg.get("Type") == "ServerDevices":
+            # SDK2: the device list sent on auth / ping
+            inner = msg.get("Message")
+            if isinstance(inner, str):
+                with contextlib.suppress(ValueError):
+                    inner = json.loads(inner)
+            devices = [d for d in (inner if isinstance(inner, list) else [])
+                       if isinstance(d, dict) and d.get("connected")]
+            positions = [SDK2_POSITIONS.get(d.get("position"), "Vest") for d in devices]
+            self._set_remote_devices(positions, devices[0].get("battery") if devices else None)
+
+    def _set_remote_devices(self, positions, battery=None):
+        self.host_remote_battery = battery if isinstance(battery, int) else None
+        if list(positions) == self.host_remote_devices:
+            return
+        self.host_remote_devices = list(positions)
+        if positions:
+            log.info("relay host: remote vest ready (%s)",
+                     ", ".join(str(p) for p in positions))
+        else:
+            log.info("relay host: remote reports no haptics device connected")
 
     async def handle(self, payload, game=False):
         for reg in payload.get("Register") or []:
@@ -2142,13 +2219,17 @@ class PlayerState:
             clean = lambda n: re.sub(r"[^\w\- .]", "", str(n)).strip(". ")
             name = clean(it.get("name", ""))
             data = it.get("project")
-            # root-level Tracks = plain .tact; otherwise prefer the manifest
-            # parser (find_project would greedily grab the first embedded
-            # pattern of a multi-event manifest)
+            # a single .tact (a bare project, or the {"project": …} container
+            # the bHaptics exporter writes) is registered under the name we
+            # were given — mods and CLI callers ask for it by file/effect
+            # name, not the author's internal project name. Otherwise prefer
+            # the manifest parser (find_project would greedily grab the first
+            # embedded pattern of a multi-event manifest)
             project = None
             if isinstance(data, dict) and ("Tracks" in data or "tracks" in data):
                 project = data
-            elif not extract_events(data):
+            elif (isinstance(data, dict) and isinstance(data.get("project"), dict)
+                  or not extract_events(data)):
                 project = find_project(data)
             if name and project is not None:
                 self.add_pattern(name, project)
@@ -3030,7 +3111,7 @@ async def main():
         await stop.wait()
 
     await state.audio.set_enabled(False)
-    state.stop_relay_host()
+    state.stop_relay_host(persist=False)  # keep Host mode for the next start
     for task in tasks:
         task.cancel()
     if vest.connected:
