@@ -302,17 +302,25 @@ def diagnose(token):
     else:
         todo.append(("prefix not created yet — run the game once, then re-run doctor", None))
 
-    # local haptic pattern files worth importing
+    # local haptic pattern files worth importing (skipping the ones the daemon
+    # already has, so a handled game stops asking every run)
     candidates = [f for f in gd.rglob("*")
                   if f.suffix.lower() in (".tact", ".json") and f.stat().st_size < 8_000_000
                   and re.search(rb'"[Tt]racks"|eventName|tactFileStr',
                                 f.read_bytes()[:2_000_000] if f.is_file() else b"")]
-    if candidates:
-        def _import():
-            subprocess.run([sys.executable, __file__, "import",
-                            *map(str, candidates)], check=False)
-        todo.append((f"import {len(candidates)} local haptic file(s): "
-                     + ", ".join(f.name for f in candidates[:5]), _import))
+    have = imported_pattern_names()
+    missing = [f for f in candidates if f.stem not in have]
+    if missing:
+        def _import(files=missing):
+            done = subprocess.run([sys.executable, __file__, "import",
+                                   *map(str, files)], capture_output=True, text=True)
+            lines = (done.stdout or "").strip().splitlines()
+            return lines + ((done.stderr or "").strip().splitlines() if done.returncode
+                            else [])
+        names = ", ".join(f.name for f in missing[:5])
+        todo.append((f"import {len(missing)} local haptic file(s): {names}", _import))
+    elif candidates:
+        report["notes"].append(f"{len(candidates)} local haptic file(s) already imported")
     else:
         report["notes"].append("no local pattern files — SDK2 events are "
                                "cloud-fetched when the game first connects")
@@ -395,9 +403,11 @@ def doctor(token, fix):
         print()
         for desc, action in todo:
             if fix and action:
-                action()
+                out = action()
                 fixed += 1
                 print(f"[fixed] {desc}")
+                for line in _as_lines(out):
+                    print(f"         {line}")
             else:
                 print(f"[todo]  {desc}")
         if not fix and any(a for _, a in todo):
@@ -469,6 +479,25 @@ BEPINEX_SHA256 = "f752ce4e838f4c305b9da1404b6745f2cff23b8bfd494f79f0c84d0a01f59b
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 Path.home() / ".local/state")) / "bhaptics-linux"
 CACHE_DIR = STATE_DIR / "cache"
+# where the daemon keeps imported patterns (player_daemon's PATTERNS_DIR), so
+# the doctor can tell an un-imported game from one we already handled
+PATTERNS_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
+                                   Path.home() / ".config")) / "bhaptics-linux" / "patterns"
+
+
+def _as_lines(out):
+    """Fix actions may return output lines to fold into the report/console."""
+    if not out:
+        return []
+    return out if isinstance(out, list) else [str(out)]
+
+
+def imported_pattern_names():
+    """Pattern names the daemon already holds (it stores patterns/<name>.tact)."""
+    try:
+        return {p.stem for p in PATTERNS_DIR.glob("*.tact")}
+    except OSError:
+        return set()
 # A change we made to Steam's own config isn't proven until Steam has been
 # restarted: Steam keeps localconfig.vdf in memory and rewrites it on exit.
 PENDING_FILE = STATE_DIR / "doctor-pending.json"
@@ -612,14 +641,15 @@ def doctor_json(target, fix):
             continue
         if fix:
             errors = []
+            extra = []
             for desc, action in todo:
                 if action:
                     try:
-                        action()
+                        extra += _as_lines(action())
                     except Exception as e:
                         errors.append(f"fix failed — {desc}: {e}")
             report, todo = diagnose(appid)
-            report["notes"] += errors
+            report["notes"] += extra + errors
         out.append(finish_report(report, todo))
     print(json.dumps(out))
 

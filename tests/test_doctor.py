@@ -1,4 +1,8 @@
 """Doctor verdicts: shipped-SDK games, and Steam launch-option handling."""
+import contextlib
+import io
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +20,7 @@ def config_root(body):
     return root
 
 
-def steam_library(launch=None, mod=False):
+def steam_library(launch=None, mod=False, tact=False):
     """A throwaway Steam root: one Proton game, and the launch options a real
     userdata file would carry (None = no userdata we can read)."""
     root = Path(tempfile.mkdtemp(prefix="bhaptics-lib-"))
@@ -30,6 +34,10 @@ def steam_library(launch=None, mod=False):
         (gd / "Mods").mkdir()
         (gd / "Mods" / "SomeGame_bhaptics.dll").write_bytes(b"mel BHAPTICS mel")
         (gd / "version.dll").write_bytes(b"MZ")
+    if tact:
+        (gd / "mod").mkdir()
+        (gd / "mod" / "ShootX.tact").write_text(
+            '{"project": {"name": "Internal_Name", "tracks": []}}')
     (sa / f"appmanifest_{APPID}.acf").write_text(
         f'"AppState"\n{{\n\t"appid"\t\t"{APPID}"\n\t"name"\t\t"Some Game"\n'
         '\t"installdir"\t\t"Some Game"\n}\n')
@@ -218,5 +226,50 @@ class VerdictTest(unittest.TestCase):
         self.assertFalse(any("proton-wrap" in m for m in done["issues"]))
 
 
+class ImportFixTest(unittest.TestCase):
+    """`doctor --fix` runs `vestctl import` — its chatter must not reach the
+    doctor's stdout (that's what made the UI report 'doctor failed'), and a
+    pattern we already hold must stop being offered."""
+
+    def setUp(self):
+        self._orig = (vst.steam_libraries, vst.steam_running, vst.PENDING_FILE,
+                      vst.PATTERNS_DIR, vst.subprocess.run)
+        self.addCleanup(self._restore)
+        tmp = Path(tempfile.mkdtemp(prefix="bhaptics-fix-"))
+        vst.PENDING_FILE = tmp / "pending.json"
+        vst.PATTERNS_DIR = tmp / "patterns"
+        vst.steam_running = lambda: False
+
+    def _restore(self):
+        (vst.steam_libraries, vst.steam_running, vst.PENDING_FILE,
+         vst.PATTERNS_DIR, vst.subprocess.run) = self._orig
+
+    def test_json_stays_parseable_when_the_import_runs(self):
+        vst.steam_libraries = lambda: [steam_library(
+            mod=True, tact=True, launch="VAR=1 /w/proton-wrap.sh %command%")]
+        vst.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(
+            a, 0, stdout='imported pattern "ShootX"\n', stderr="")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            vst.doctor_json(APPID, True)
+        report = json.loads(buf.getvalue())[0]      # raised when polluted
+        self.assertTrue(any("ShootX" in n for n in report["notes"]))
+
+    def test_import_is_not_offered_once_the_pattern_exists(self):
+        root = steam_library(mod=True, tact=True,
+                             launch="VAR=1 /w/proton-wrap.sh %command%")
+        vst.steam_libraries = lambda: [root]
+
+        report, todo = vst.diagnose(APPID)
+        self.assertTrue(any("import" in d for d, _ in todo))
+
+        vst.PATTERNS_DIR.mkdir(parents=True)
+        (vst.PATTERNS_DIR / "ShootX.tact").write_text("{}")
+        report, todo = vst.diagnose(APPID)
+        self.assertFalse(any("import" in d for d, _ in todo))
+        self.assertTrue(any("already imported" in n for n in report["notes"]))
+
+
 if __name__ == "__main__":
     unittest.main()
+
