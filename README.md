@@ -61,6 +61,14 @@ project does it.
   moment a game connects, sends a pattern, or the audio it follows makes
   noise again — or when you switch the vest back on, click the status pill in
   the UI, pick *Wake* in the tray, or run `vestctl wake`.
+- **Pause / Stop all** — *Stop all* silences everything the daemon is driving
+  right now (key/frame effects, OSC and audio mode), and *Disable daemon* stops
+  it serving game clients entirely while leaving the vest link and this UI up.
+  That is the control to reach for when a game's bundled SDK client crashes
+  while the daemon is connected (Half-Life 2: VR Mod does). While disabled, a
+  game's connection is refused with HTTP 503 rather than accepted and left
+  hanging, so it reads as "no Player running", and the switch survives a
+  restart.
 - **Auto per-game presets** — name a preset exactly like the app in the
   source list (case-insensitive) and it applies itself, bound to that app's
   audio, the moment the game makes sound; your previous setup is restored

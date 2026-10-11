@@ -147,6 +147,30 @@ def set_report_vest(enabled):
     _save_network(cfg)
 
 
+DISABLED_FLAG = CONFIG_DIR / "disabled"
+
+
+def daemon_disabled():
+    """UI "pause": refuse game clients without taking the unit down.
+
+    Stopping the service is the only reliable way to stop this daemon driving a
+    fragile game SDK client (the one bundled with Half-Life 2: VR Mod dies when
+    it is), but it also takes the control UI with it. A flag file gives the same
+    effect and keeps the UI on 15881, so it can be switched back on in place.
+    """
+    return DISABLED_FLAG.exists()
+
+
+def set_daemon_disabled(disabled):
+    if disabled:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            DISABLED_FLAG.touch()
+    else:
+        with contextlib.suppress(OSError):
+            DISABLED_FLAG.unlink()
+
+
 def _is_local_ip(ip):
     if ip in ("127.0.0.1", "::1", "localhost"):
         return True
@@ -168,6 +192,13 @@ TICK_MS = 20
 # The Pro/new-gen firmware exposes the same 40-slot frame.
 DEFAULT_FRONT = [31, 30, 1, 0, 33, 32, 3, 2, 35, 34, 5, 4, 37, 36, 7, 6, 39, 38, 9, 8]
 DEFAULT_BACK = [10, 11, 20, 21, 12, 13, 22, 23, 14, 15, 24, 25, 16, 17, 26, 27, 18, 19, 28, 29]
+
+# What a game's SDK1 client is told. The real Player reports device and key
+# state and nothing else; mapping, feel, audio, relay internals, patterns and
+# the rest are our control-UI surface. A strict client parser (the one HL2VR
+# ships) can fall over on it, so game sockets get the protocol, not the UI.
+GAME_STATUS_KEYS = ("RegisteredKeys", "ActiveKeys", "ConnectedDeviceCount",
+                    "ConnectedPositions", "VestIdle", "Battery")
 
 
 def pack(motors40):
@@ -1851,8 +1882,7 @@ class PlayerState:
 
     def status_message(self, for_game=False):
         vest_on = self.vest.connected or (for_game and self.report_vest)
-        return json.dumps(
-            {
+        full = {
                 "RegisteredKeys": list(self.registered.keys()),
                 "ActiveKeys": list(self.active.keys()),
                 "ConnectedDeviceCount": 1 if vest_on else 0,
@@ -1896,8 +1926,12 @@ class PlayerState:
                 "MissingKeys": sorted(self.missing_keys),
                 "Battery": self.vest.battery,
                 "Version": __version__,
+                "DaemonEnabled": not daemon_disabled(),
             }
-        )
+        if for_game:
+            # The Player tells a game about device/key state, nothing else.
+            return json.dumps({k: full[k] for k in GAME_STATUS_KEYS if k in full})
+        return json.dumps(full)
 
     def _bg(self, coro):
         task = asyncio.create_task(coro)
@@ -1977,6 +2011,21 @@ class PlayerState:
             self._bg(ws.close())
         if persist:
             set_relay_host(False)
+
+    async def set_daemon_enabled(self, enabled):
+        """Pause/resume game-facing service without stopping the unit."""
+        if enabled == (not daemon_disabled()):
+            return
+        set_daemon_disabled(not enabled)
+        if enabled:
+            log.info("daemon enabled — serving game clients again")
+            if relay_host_from_config():
+                self.start_relay_host()
+        else:
+            log.info("daemon disabled — game clients are refused, UI stays up")
+            # persist=False: the Host preference must survive the pause
+            self.stop_relay_host(persist=False)
+            self._drop_game_clients()
 
     def _proxy_failed(self, exc):
         self.relay_error = str(exc)
@@ -2116,7 +2165,15 @@ class PlayerState:
             stype = sub.get("Type")
             key = sub.get("Key", "")
             if stype == "turnOffAll":
+                # A real stop. Clearing key/frame effects alone left audio-mode
+                # and OSC haptics still driving the vest, so the button looked
+                # dead (and was, whenever audio mode was running).
                 self.active.clear()
+                self.active_preset = ""
+                self.osc_front = [0.0] * 20
+                self.osc_back = [0.0] * 20
+                if self.audio.enabled:
+                    await self.audio.set_enabled(False, intent=True)
             elif stype == "turnOff":
                 self.active.pop(key, None)
             elif stype == "frame":
@@ -2210,6 +2267,9 @@ class PlayerState:
                 self.start_relay_host()
             else:
                 self.stop_relay_host()
+
+        if "DaemonEnabled" in payload:
+            await self.set_daemon_enabled(bool(payload["DaemonEnabled"]))
 
         if "ReportVest" in payload:
             # some native titles gate every effect on the device list; when the
@@ -2833,16 +2893,20 @@ class PlayerState:
         while True:
             if self.clients:
                 plain = self.status_message()
-                fake = self.status_message(for_game=True) if self.report_vest else plain
                 for ws in list(self.clients):
-                    # game clients may be told a vest is present (opt-in) while
-                    # our own UI always gets the truth
-                    msg = fake if ws in self.game_clients else plain
-                    if last.get(ws) == msg:
+                    # A game socket gets a reply to its own traffic (and one on
+                    # connect) from ws_handler. Broadcasting our UI status to it
+                    # on every change is not what the Player does, and that kind
+                    # of unsolicited chatter is how a bundled SDK client dies.
+                    # (report_vest is still honoured — it is applied to the
+                    # for_game reply, not here.)
+                    if ws in self.game_clients:
+                        continue
+                    if last.get(ws) == plain:
                         continue
                     with contextlib.suppress(Exception):
-                        await ws.send(msg)
-                        last[ws] = msg
+                        await ws.send(plain)
+                        last[ws] = plain
                 for ws in list(last):
                     if ws not in self.clients:
                         last.pop(ws, None)
@@ -2896,14 +2960,19 @@ async def ws_handler(ws, state):
     if not is_game and not _is_loopback(getattr(ws, "remote_address", None)):
         await ws.close(code=1008, reason="UI is local-only")
         return
+    if is_game and daemon_disabled():
+        await ws.close(code=1013, reason="daemon disabled")
+        return
     if is_game and state.relay_host:
         await state.wait_for_remote()
         if state.host_remote:
             try:
                 await state.proxy_sdk1(ws)
+                return
             except Exception as e:
+                # The peer was discovered but is gone: serve the game here
+                # rather than leaving it holding a socket that never answers.
                 state._proxy_failed(e)
-            return
     state.clients.add(ws)
     if is_game:
         state.game_clients[ws] = app_name or app_id or "unnamed client"
@@ -2984,14 +3053,17 @@ async def sdk2_handler(ws, state):
     q = parse_qs(urlparse(ws.request.path).query)
     workspace_id = (q.get("workspace_id") or [""])[0]
     api_key = (q.get("api_key") or [""])[0]
+    if daemon_disabled():
+        await ws.close(code=1013, reason="daemon disabled")
+        return
     if state.relay_host:
         await state.wait_for_remote()
         if state.host_remote:
             try:
                 await state.proxy_sdk2(ws)
+                return
             except Exception as e:
                 state._proxy_failed(e)
-            return
     log.info("sdk2 client connected: workspace_id=%r", workspace_id)
     state.game_clients[ws] = f"SDK2: {workspace_id or 'unknown'}"
     state.vest.mark_active()  # a game is here: wake the vest if it slept
@@ -3041,8 +3113,23 @@ def _is_loopback(addr):
     return host == "::1" or host.startswith("127.")
 
 
+def _sdk1_app_id(path):
+    from urllib.parse import parse_qs
+
+    with contextlib.suppress(Exception):
+        return (parse_qs(urlparse(path).query).get("app_id") or [""])[0]
+    return ""
+
+
 def process_request(connection, request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
+        # A disabled daemon must look *absent* to a game client: the upgrade has
+        # to fail, not succeed and then hang up. Games read "refused" as "the
+        # Player isn't running"; a socket that opens and never answers is what
+        # makes them fall over. The UI (app_id=ui) is still served.
+        if daemon_disabled() and _sdk1_app_id(request.path) != "ui":
+            return connection.respond(http.HTTPStatus.SERVICE_UNAVAILABLE,
+                                      "daemon disabled\n")
         return None
     path = urlparse(request.path).path
     if path in ("/", "/ui", "/ui.html"):
@@ -3138,7 +3225,10 @@ async def main():
     migrate_legacy_state()
     vest = VestLink()
     state = PlayerState(vest)
-    if relay_host_from_config():
+    if daemon_disabled():
+        log.info("daemon disabled (UI switch) — game clients will be refused; "
+                 "re-enable from the UI at http://127.0.0.1:%d/ui", SDK1_PORT)
+    elif relay_host_from_config():
         if remote_play_enabled():
             set_remote_play(False)
         state.start_relay_host()

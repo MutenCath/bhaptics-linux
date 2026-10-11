@@ -18,7 +18,8 @@ class IsolatedTestCase(unittest.TestCase):
 
     NAMES = ("CONFIG_DIR", "STATE_DIR", "MAPPING_FILE", "PATTERNS_DIR",
              "AUDIO_CONF", "PRESETS_FILE", "LEARNED_FILE", "EFFECTS_FILE",
-             "MIGRATED_MARK", "SDK2_CACHE", "FEEL_FILE", "NETWORK_FILE")
+             "MIGRATED_MARK", "SDK2_CACHE", "FEEL_FILE", "NETWORK_FILE",
+             "DISABLED_FLAG")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="bhaptics-test-"))
@@ -35,6 +36,7 @@ class IsolatedTestCase(unittest.TestCase):
         pd.SDK2_CACHE = self.tmp / "sdk2_cache"
         pd.FEEL_FILE = self.tmp / "feel.json"
         pd.NETWORK_FILE = self.tmp / "network.json"
+        pd.DISABLED_FLAG = self.tmp / "disabled"
 
     def tearDown(self):
         for name, value in self._orig.items():

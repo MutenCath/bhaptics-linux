@@ -166,6 +166,9 @@
     font-weight: 600;
   }
   button.stopall:hover { background: var(--bad); color: #1a0505; }
+  button.power { background: #2b2f3a; color: #dfe3ea; }
+  button.power:hover { background: var(--warn); color: #1a1205; }
+  button.power.off { background: var(--bad); color: #1a0505; }
   button.small { padding: 6px 12px; font-size: .84em; }
 
   /* ---- vest torsos & motors ---- */
@@ -323,6 +326,8 @@
     <div class="statuspill" id="status" onclick="if (lastStatus && lastStatus.VestIdle) { send({Wake: true}); toast('waking the vest…'); }"><span class="dot"></span><span id="statustext">connecting…</span></div>
     <div class="batt" id="batt" hidden><span class="case"><i id="battfill"></i></span><span class="num" id="battpct"></span></div>
     <div class="chips" id="game"></div>
+    <button class="stopall power" id="power" onclick="toggleDaemon()"
+      title="Stop serving game clients. The vest link and this UI stay up, so it can be switched back on here.">⏻&nbsp; Disable daemon</button>
     <button class="stopall" onclick="turnOffAll()">■&nbsp; Stop all</button>
   </div>
   <nav class="nav">
@@ -686,8 +691,10 @@ function connect() {
       return;
     }
     lastStatus = msg;
+    updatePower(msg.DaemonEnabled !== false);
     const c = msg.ConnectedDeviceCount > 0;
-    if (c) setStatus("vest connected", true);
+    if (msg.DaemonEnabled === false) setStatus("daemon off — games refused", false);
+    else if (c) setStatus("vest connected", true);
     else if (msg.VestIdle) setStatus("vest asleep — click to wake", null);
     else setStatus("searching for vest…", false);
     const batt = document.getElementById("batt");
@@ -847,6 +854,18 @@ function fireRaw(motor, dur) {
   send({Submit: [{Type: "raw", Key: "ui-raw", Frame: {Motors: motors, DurationMillis: dur || duration()}}]});
 }
 function turnOffAll() { send({Submit: [{Type: "turnOffAll"}]}); }
+function toggleDaemon() {
+  const on = lastStatus ? lastStatus.DaemonEnabled !== false : true;
+  send({DaemonEnabled: !on});
+  toast(on ? "daemon disabled — game clients refused"
+           : "daemon enabled — serving game clients");
+}
+function updatePower(on) {
+  const b = document.getElementById("power");
+  if (!b) return;
+  b.textContent = on ? "⏻  Disable daemon" : "⏻  Enable daemon";
+  b.classList.toggle("off", !on);
+}
 function remotePlayMode() {
   const mode = document.getElementById("rpmode").value;
   if (mode === "off") send({RemotePlay: false, RelayHost: false});
