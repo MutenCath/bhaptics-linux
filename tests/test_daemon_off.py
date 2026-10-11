@@ -8,6 +8,7 @@ be fed the control-UI status blob.
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
 
 import player_daemon as pd
 from tests.base import FakeVest, IsolatedTestCase
@@ -63,6 +64,56 @@ class SetDaemonEnabledTest(IsolatedTestCase):
             self.assertTrue(pd.daemon_disabled())
             await st.set_daemon_enabled(True)
             self.assertFalse(pd.daemon_disabled())
+
+        asyncio.run(go())
+
+
+class _FakeWS:
+    """Just enough of a websockets connection for ws_handler."""
+
+    def __init__(self, path, remote=("127.0.0.1", 5000), inbound=()):
+        self.request = SimpleNamespace(path=path)
+        self.remote_address = remote
+        self.sent = []
+        self.closed = None
+        self._inbound = list(inbound)
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def close(self, code=None, reason=None):
+        self.closed = (code, reason)
+
+    def __aiter__(self):
+        async def gen():
+            for message in self._inbound:
+                yield message
+
+        return gen()
+
+
+class SwitchOverTheWireTest(IsolatedTestCase):
+    def test_ui_toggle_flips_the_switch(self):
+        """The UI button is a flip: its message turns the daemon off, the reply
+        tells the page to relabel itself."""
+        async def go():
+            st = pd.PlayerState(FakeVest())
+            ws = _FakeWS("/v2/feedbacks?app_id=ui&app_name=VestUI",
+                         inbound=[json.dumps({"DaemonEnabled": False})])
+            await pd.ws_handler(ws, st)
+            self.assertTrue(pd.daemon_disabled())
+            self.assertIs(json.loads(ws.sent[-1])["DaemonEnabled"], False)
+
+        asyncio.run(go())
+
+    def test_game_is_refused_while_disabled(self):
+        async def go():
+            st = pd.PlayerState(FakeVest())
+            pd.set_daemon_disabled(True)
+            ws = _FakeWS("/v2/feedbacks?app_id=hl2vr&app_name=Half-Life")
+            await pd.ws_handler(ws, st)
+            self.assertEqual(ws.closed[0], 1013)
+            self.assertEqual(ws.sent, [])
 
         asyncio.run(go())
 

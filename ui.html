@@ -856,6 +856,7 @@ function fireRaw(motor, dur) {
 function turnOffAll() { send({Submit: [{Type: "turnOffAll"}]}); }
 function toggleDaemon() {
   const on = lastStatus ? lastStatus.DaemonEnabled !== false : true;
+  updatePower(!on);   // flip straight away; the next status confirms it
   send({DaemonEnabled: !on});
   toast(on ? "daemon disabled — game clients refused"
            : "daemon enabled — serving game clients");
@@ -864,7 +865,10 @@ function updatePower(on) {
   const b = document.getElementById("power");
   if (!b) return;
   b.textContent = on ? "⏻  Disable daemon" : "⏻  Enable daemon";
+  b.title = on ? "Stop serving game clients — the vest link and this UI stay up"
+               : "Serve game clients again (remembered across restarts)";
   b.classList.toggle("off", !on);
+  b.setAttribute("aria-pressed", String(!on));
 }
 function remotePlayMode() {
   const mode = document.getElementById("rpmode").value;
