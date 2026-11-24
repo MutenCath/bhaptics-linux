@@ -71,6 +71,8 @@ class _DiscoveryClient(asyncio.DatagramProtocol):
             return
         if parts[2] != self.nonce or addr[0] in ("127.0.0.1", "::1"):
             return
+        if parts[3] == socket.gethostname().replace(" ", "-"):
+            return  # a daemon on this machine: relaying to ourselves loops
         self.offers[addr[0]] = (parts[3], parts[4:])
 
 
@@ -85,10 +87,17 @@ async def _discover(timeout, targets=("255.255.255.255",)):
     transport, _ = await loop.create_datagram_endpoint(lambda: proto, sock=sock)
     probe = f"{DISCOVERY_PREFIX} DISCOVER {nonce}".encode()
     try:
-        for target in targets:
-            with contextlib.suppress(OSError):
-                transport.sendto(probe, (target, DISCOVERY_PORT))
-        await asyncio.sleep(timeout)
+        # UDP probes get lost on real LANs (Wi-Fi especially): re-send a few
+        # times across the wait window instead of relying on a single packet
+        elapsed = 0.0
+        while True:
+            for target in targets:
+                with contextlib.suppress(OSError):
+                    transport.sendto(probe, (target, DISCOVERY_PORT))
+            if elapsed >= timeout:
+                break
+            await asyncio.sleep(min(0.5, timeout - elapsed))
+            elapsed += 0.5
     finally:
         transport.close()
     return proto.offers

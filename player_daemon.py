@@ -1943,7 +1943,7 @@ class PlayerState:
         for ws in list(self.game_clients):
             self._bg(ws.close())
 
-    def start_relay_host(self):
+    async def start_relay_host(self):
         if self.relay_host:
             return
         self.relay_host = True
@@ -1954,6 +1954,11 @@ class PlayerState:
         self._config_failed = False
         self.vest.host_mode = True  # stop owning a local BLE link while hosting
         set_relay_host(True)
+        # Release any local link right away: the vest allows a single BLE
+        # connection, so the remote device can't take it while we still hold
+        # it — waiting for the maintain loop's next cycle could stall the
+        # handover by the length of an in-flight scan or connect attempt.
+        await self.vest._close()
         self._restart_finder()
         self._drop_game_clients()
 
@@ -2007,6 +2012,10 @@ class PlayerState:
         self._config_failed = False
         if self._finder is not None and not self._finder.done():
             self._finder.cancel()
+        # A cancelled task is not done() until the loop delivers the
+        # CancelledError — a rapid off/on toggle must not see the dying task
+        # and skip starting a fresh finder.
+        self._finder = None
         for ws in list(self.proxied):
             self._bg(ws.close())
         if persist:
@@ -2020,7 +2029,7 @@ class PlayerState:
         if enabled:
             log.info("daemon enabled — serving game clients again")
             if relay_host_from_config():
-                self.start_relay_host()
+                await self.start_relay_host()
         else:
             log.info("daemon disabled — game clients are refused, UI stays up")
             # persist=False: the Host preference must survive the pause
@@ -2032,6 +2041,12 @@ class PlayerState:
         log.warning("relay host: proxy failed: %s", exc)
         self.host_remote = ""
         self._config_failed = True
+        # The remote device is gone: every other proxied game is hanging on a
+        # dead pipe too. Close them so each reconnect takes the fresh path
+        # (rediscovery, or local serving when nothing is found) instead of
+        # waiting on TCP to notice.
+        for ws in list(self.proxied):
+            self._bg(ws.close())
         self._restart_finder()
 
     async def _proxy(self, ws, scheme, port):
@@ -2264,7 +2279,7 @@ class PlayerState:
                 if remote_play_enabled():
                     set_remote_play(False)
                     asyncio.get_running_loop().call_later(0.4, _rebind)
-                self.start_relay_host()
+                await self.start_relay_host()
             else:
                 self.stop_relay_host()
 
@@ -2939,10 +2954,10 @@ class PlayerState:
                                 "audio haptics paused while the game sends patterns",
                                 urgency="low", replace="bhaptics-sup")
                     paused_notice = now
-            elif not sup and last_sup and sup_since is not None:
-                if self.audio.enabled and now - sup_since > 60:
-                    self.notify("Audio haptics resumed", "vest is back on game audio",
-                                urgency="low", replace="bhaptics-sup")
+            elif (not sup and last_sup and sup_since is not None
+                    and self.audio.enabled and now - sup_since > 60):
+                self.notify("Audio haptics resumed", "vest is back on game audio",
+                            urgency="low", replace="bhaptics-sup")
             last_sup = sup
             await asyncio.sleep(1)
 
@@ -3163,6 +3178,12 @@ async def supervise(name, fn):
             await asyncio.sleep(2)
 
 
+def _discovery_name():
+    # probers whitespace-split the OFFER, so a space in the hostname would
+    # break parsing — sanitize once, and compare against the same form
+    return socket.gethostname().replace(" ", "-") or "bhaptics-linux"
+
+
 class DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self):
         self.transport = None
@@ -3174,7 +3195,7 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         parts = data.decode(errors="replace").split()
         if len(parts) != 3 or parts[0] != "BHAPTICS-LINUX/1" or parts[1] != "DISCOVER":
             return
-        reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {socket.gethostname()} "
+        reply = (f"BHAPTICS-LINUX/1 OFFER {parts[2]} {_discovery_name()} "
                  f"{SDK1_PORT} {SDK2_PORT} {OSC_PORT}")
         self.transport.sendto(reply.encode(), addr)
 
@@ -3196,7 +3217,7 @@ async def discover_vest_host(timeout=1.5):
         def datagram_received(self, data, addr):
             parts = data.decode(errors="replace").split()
             if (len(parts) == 7 and parts[0] == "BHAPTICS-LINUX/1" and parts[1] == "OFFER"
-                    and parts[2] == nonce and parts[3] != socket.gethostname()
+                    and parts[2] == nonce and parts[3] != _discovery_name()
                     and addr[0] not in ("127.0.0.1", "::1")):
                 found.append(addr[0])
 
@@ -3231,7 +3252,7 @@ async def main():
     elif relay_host_from_config():
         if remote_play_enabled():
             set_remote_play(False)
-        state.start_relay_host()
+        await state.start_relay_host()
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

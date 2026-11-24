@@ -51,9 +51,14 @@ class FakeVest:
         self.battery = None
         self.idle = False
         self.host_mode = False
+        self.closed = 0
 
     def mark_active(self):
         pass
 
     async def send(self, motors40):
         pass
+
+    async def _close(self):
+        self.closed += 1
+        self.connected = False

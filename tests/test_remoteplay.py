@@ -92,11 +92,66 @@ class RelayHostTest(IsolatedTestCase):
         st = pd.PlayerState(vest)
 
         async def go():
-            st.start_relay_host()           # needs a loop: it starts the finder
+            await st.start_relay_host()     # needs a loop: it starts the finder
             self.assertTrue(vest.host_mode)
             st.stop_relay_host()
             self.assertFalse(vest.host_mode)
         asyncio.run(go())
+
+    def test_start_releases_a_held_vest_link_immediately(self):
+        # the vest allows one BLE connection: the remote device can only take
+        # it once we let go, so start must not wait for the maintain loop
+        vest = FakeVest()
+        vest.connected = True
+        st = pd.PlayerState(vest)
+
+        async def go():
+            await st.start_relay_host()
+            st.stop_relay_host()
+        asyncio.run(go())
+        self.assertEqual(vest.closed, 1)
+        self.assertFalse(vest.connected)
+
+    def test_rapid_toggle_restarts_the_finder(self):
+        # a cancelled task is not done() yet when the toggle flips back on;
+        # start must not mistake the dying finder for a live one
+        st = pd.PlayerState(FakeVest())
+
+        async def go():
+            await st.start_relay_host()
+            first = st._finder
+            st.stop_relay_host()
+            await st.start_relay_host()
+            self.assertIsNotNone(st._finder)
+            self.assertIsNot(st._finder, first)
+            st.stop_relay_host()
+            self.assertIsNone(st._finder)
+        asyncio.run(go())
+
+    def test_proxy_failed_closes_remaining_proxies(self):
+        # the remote device is gone: other games must not hang on dead pipes
+        st = pd.PlayerState(FakeVest())
+        st.relay_host = True
+        st.host_remote = "10.0.0.5"
+
+        class WS:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        ws = WS()
+        st.proxied.add(ws)
+
+        async def go():
+            st._proxy_failed(Exception("gone"))
+            self.assertEqual(st.host_remote, "")
+            self.assertTrue(st._config_failed)
+            await asyncio.sleep(0.05)
+            st.stop_relay_host()
+        asyncio.run(go())
+        self.assertTrue(ws.closed)
 
     def test_remote_device_state_from_sdk1_status(self):
         st = pd.PlayerState(FakeVest())
