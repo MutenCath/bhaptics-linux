@@ -374,6 +374,19 @@ class Effect:
         return self.timeline[idx]
 
 
+def _norm_effect_frames(raw):
+    """Designer frames -> clamped {ms, front, back} dicts (both save and play
+    paths go through this, so disk and wire frames get the same limits)."""
+    frames = []
+    for f in (raw or [])[:200]:
+        frames.append({
+            "ms": max(TICK_MS, min(10000, int(f.get("ms", 100)))),
+            "front": [min(1.0, max(0.0, float(v))) for v in (f.get("front") or [])][:20],
+            "back": [min(1.0, max(0.0, float(v))) for v in (f.get("back") or [])][:20],
+        })
+    return frames
+
+
 def compile_frame_submit(frame_msg):
     duration = int(frame_msg.get("DurationMillis", 100)) or 100
     position = frame_msg.get("Position", "Vest")
@@ -820,6 +833,15 @@ DISCOVERY_PORT = 15880  # LAN discovery probe/response for tools/remote-relay.py
 MIN_PROXY_NOTE_SECS = 15
 MSG_TYPE_RE = re.compile(r'"Type"\s*:\s*"([A-Za-z]+)"')
 PLAY_TYPES = ("frame", "raw", "key")  # SDK1 submits; SDK2 is SdkPlay*
+MAX_PATTERNS = 5000  # games can Register/import patterns without bound; cap
+MAX_LEARNED_APPS = 200  # per-app audio tuning memory
+
+
+def _dict_cap(d, limit):
+    """Safety valve for dicts external input can grow: drop oldest entries
+    (dicts are insertion-ordered) once past the limit."""
+    while len(d) > limit:
+        d.pop(next(iter(d)))
 # SDK2 ServerDevices position code -> name (see the SDK's PositionType)
 SDK2_POSITIONS = {0: "Vest", 1: "ForearmL", 2: "ForearmR", 3: "Head"}
 OSC_RE = re.compile(r"^/avatar/parameters/bOSC/v2/(VestFront|VestBack)/(\d+)$")
@@ -981,6 +1003,7 @@ class AudioEngine:
         if not app_key:
             return
         self.learned[app_key.lower()] = self._snapshot()
+        _dict_cap(self.learned, MAX_LEARNED_APPS)
         self._save_learned()
 
     def _save_learned(self):
@@ -1135,12 +1158,26 @@ class AudioEngine:
             self._proc = await asyncio.create_subprocess_exec(
                 "parec", "--format=s16le", f"--rate={AUDIO_RATE}", *chans,
                 "--latency-msec=20", *target,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
+            errbuf = bytearray()
+
+            async def drain_stderr(proc, buf):
+                # keep the tail: when parec dies (PipeWire restart, source
+                # gone) the reason sits at the end of its stderr
+                while chunk := await proc.stderr.read(4096):
+                    buf.extend(chunk)
+                    del buf[:-4096]
+
+            drain = asyncio.create_task(drain_stderr(self._proc, errbuf))
             log.info("audio capture started (%s%s)", " ".join(target),
                      " [5.1]" if surround else "")
             await self._pump(surround)
             self._stop_proc()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(drain, 1)
+            if errbuf:
+                log.info("parec: %s", errbuf.decode(errors="replace").strip()[:400])
             await asyncio.sleep(1)
 
     async def _pump(self, surround=False):
@@ -1791,6 +1828,8 @@ class PlayerState:
         self.registered[name] = project
         self.patterns.add(name)
         self.sdk2_events[name] = project
+        _dict_cap(self.registered, MAX_PATTERNS)
+        _dict_cap(self.sdk2_events, MAX_PATTERNS)
         self.missing_keys.pop(name, None)
 
     def _note_missing(self, name):
@@ -1828,6 +1867,7 @@ class PlayerState:
 
     def _learn_sdk2(self, events, workspace_id):
         self.sdk2_events.update(events)
+        _dict_cap(self.sdk2_events, MAX_PATTERNS)
         if workspace_id:
             self.sdk2_ws_events.setdefault(workspace_id, {}).update(events)
 
@@ -2173,6 +2213,7 @@ class PlayerState:
             project = reg.get("Project")
             if key and project:
                 self.registered[key] = project
+                _dict_cap(self.registered, MAX_PATTERNS)
                 self.missing_keys.pop(key, None)
                 log.info("registered %r", key)
 
@@ -2336,13 +2377,7 @@ class PlayerState:
         if "SaveEffect" in payload:
             fx = payload["SaveEffect"]
             name = str(fx.get("name", "")).strip()
-            frames = []
-            for f in fx.get("frames", [])[:200]:
-                frames.append({
-                    "ms": max(TICK_MS, min(10000, int(f.get("ms", 100)))),
-                    "front": [min(1.0, max(0.0, float(v))) for v in (f.get("front") or [])][:20],
-                    "back": [min(1.0, max(0.0, float(v))) for v in (f.get("back") or [])][:20],
-                })
+            frames = _norm_effect_frames(fx.get("frames"))
             if name and frames:
                 self.effects[name] = frames
                 self._save_effects()
@@ -2350,14 +2385,20 @@ class PlayerState:
                     log.info("effect saved: %r (%d frames)", name, len(frames))
 
         if "PlayEffect" in payload:
-            name = str(payload["PlayEffect"])
-            frames = self.effects.get(name)
-            if frames:
-                timeline = []
-                for f in frames:
-                    fr = (f["front"] + [0.0] * 20)[:20]
-                    bk = (f["back"] + [0.0] * 20)[:20]
-                    timeline += [("mapped", fr, bk)] * max(1, f["ms"] // TICK_MS)
+            spec = payload["PlayEffect"]
+            if isinstance(spec, dict):
+                # designer preview: play the unsaved frames directly, so no
+                # reserved name can collide with a user's saved effect
+                name, frames = "preview", _norm_effect_frames(spec.get("frames"))
+            else:
+                name = str(spec)
+                frames = self.effects.get(name) or []
+            timeline = []
+            for f in frames:
+                fr = (f["front"] + [0.0] * 20)[:20]
+                bk = (f["back"] + [0.0] * 20)[:20]
+                timeline += [("mapped", fr, bk)] * max(1, f["ms"] // TICK_MS)
+            if timeline:
                 self.active[f"fx:{name}"] = Effect(name, timeline)
 
         if ("DeleteEffect" in payload
@@ -2734,6 +2775,8 @@ class PlayerState:
             next_tick += TICK_MS / 1000
             now = time.monotonic()
             if next_tick < now - 0.1:  # fell far behind (BLE stall): resync
+                log.debug("mixer fell %.0f ms behind — resyncing",
+                          (now - next_tick) * 1000)
                 next_tick = now
             await asyncio.sleep(max(0.0, next_tick - now))
 
@@ -3311,6 +3354,8 @@ async def main():
     await state.audio.set_enabled(False)
     state.stop_relay_host(persist=False)  # keep Host mode for the next start
     for task in tasks:
+        task.cancel()
+    for task in list(state._bg_tasks):
         task.cancel()
     if vest.connected:
         with contextlib.suppress(Exception):

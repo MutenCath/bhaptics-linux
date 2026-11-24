@@ -662,13 +662,18 @@
 
 <script>
 let ws, lastStatus = null, mappingDirty = false, wizard = null, audioInit = false;
+let retryMs = 1000;
 
 function connect() {
+  if (ws && ws.readyState < 2) ws.close();
   ws = new WebSocket("ws://127.0.0.1:15881/v2/feedbacks?app_id=ui&app_name=VestUI");
-  ws.onopen = () => { setStatus("waiting for vest…", null);
+  ws.onopen = () => { retryMs = 1000;
+                      setStatus("waiting for vest…", null);
                       ws.send(JSON.stringify({Subscribe: "audiometer"}));
                       refreshSources(); };
-  ws.onclose = () => { setStatus("daemon unreachable — retrying…", false); setTimeout(connect, 2000); };
+  ws.onclose = () => { setStatus("daemon unreachable — retrying…", false);
+                       setTimeout(connect, retryMs);
+                       retryMs = Math.min(30000, retryMs * 2); };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.AudioMeter) {
@@ -900,12 +905,15 @@ function audioSend() {
 function sourceSend() {
   send({AudioMode: {source: document.getElementById("asrc").value || "auto"}});
 }
-let feelInit = false;
+let feelInit = false, feelTimer = null;
 function feelSend() {
-  send({Feel: {strength: parseFloat(document.getElementById("fstrength").value),
-               floor: parseInt(document.getElementById("ffloor").value),
-               smooth: document.getElementById("fsmooth").checked,
-               punch: document.getElementById("fpunch").checked}});
+  clearTimeout(feelTimer);
+  feelTimer = setTimeout(() => {
+    send({Feel: {strength: parseFloat(document.getElementById("fstrength").value),
+                 floor: parseInt(document.getElementById("ffloor").value),
+                 smooth: document.getElementById("fsmooth").checked,
+                 punch: document.getElementById("fpunch").checked}});
+  }, 120);
 }
 function refreshSources() { send({ListAudioSources: true}); }
 function fillSources(list) {
@@ -1105,14 +1113,21 @@ function mapChanged() {
 }
 function saveMapping() {
   clearTimeout(mapTimer);
-  const read = (tid) => {
+  let bad = 0;
+  const cur = (lastStatus && lastStatus.Mapping) || null;
+  const read = (tid, side) => {
     const out = new Array(20);
-    document.querySelectorAll(`#${tid} input`).forEach(inp => out[inp.dataset.dot] = parseInt(inp.value));
+    document.querySelectorAll(`#${tid} input`).forEach(inp => {
+      const n = parseInt(inp.value), d = +inp.dataset.dot;
+      if (Number.isInteger(n) && n >= 0 && n < 40) out[d] = n;
+      else { bad++; out[d] = cur ? cur[side][d] : 0; }
+    });
     return out;
   };
-  send({SetMapping: {front: read("mfront"), back: read("mback")}});
+  send({SetMapping: {front: read("mfront", "front"), back: read("mback", "back")}});
   mappingDirty = false;
-  document.getElementById("mapinfo").textContent = "";
+  document.getElementById("mapinfo").textContent =
+    bad ? bad + " invalid cell(s) kept their previous value" : "";
   toast("mapping saved");
 }
 function flipMap(tid) {
@@ -1185,8 +1200,7 @@ function fxDel() {
 }
 function fxClear() { fx.frames[fx.cur] = newFrame(); fxRender(); }
 function fxPlayAll() {
-  send({SaveEffect: {name: "__preview", frames: fx.frames}});
-  send({PlayEffect: "__preview"});
+  send({PlayEffect: {frames: fx.frames}});
 }
 function fxSave() {
   const n = document.getElementById("fxname").value.trim();
@@ -1292,7 +1306,7 @@ function renderGames() {
     name.className = "gname"; name.textContent = g.name;
     const chip = document.createElement("span");
     chip.className = "kchip" + (g.kind === "mod" ? " mod" : "");
-    chip.textContent = g.kind === "mod" ? "mod" : (g.native ? "native build" : "built-in SDK");
+    chip.textContent = g.kind === "mod" ? "mod" : (g.kind === "error" ? "scan error" : (g.native ? "native build" : "built-in SDK"));
     const stat = document.createElement("span");
     const bits = [...(g.issues || []), ...(g.manual || [])];
     if (g.anticheat) {

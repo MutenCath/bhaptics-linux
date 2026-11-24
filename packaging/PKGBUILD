@@ -7,9 +7,11 @@ pkgrel=1
 pkgdesc="bHaptics TactSuit Player emulator: SDK1/SDK2/OSC/audio -> BLE, no Windows Player"
 arch=(any)
 license=(GPL-3.0-or-later)
-depends=(python python-websockets python-bleak python-numpy python-evdev bluez libpulse openssl)
-optdepends=('python-pystray: system tray quick control (bhaptics-tray)'
-            'python-pillow: system tray icon')
+depends=(python python-websockets python-bleak python-numpy bluez libpulse openssl)
+optdepends=('python-evdev: gamepad rumble mirror (vestctl pad)'
+            'python-pystray: system tray quick control (bhaptics-tray)'
+            'python-pillow: system tray icon'
+            'xdg-utils: open the web UI from the app launcher')
 
 package() {
   local src
@@ -21,6 +23,7 @@ package() {
     "$pkgdir/usr/lib/bhaptics-linux/tools/proton-sdk2-setup.sh"
   install -Dm755 "$src/tools/proton-wrap.sh" \
     "$pkgdir/usr/lib/bhaptics-linux/tools/proton-wrap.sh"
+  install -Dm755 "$src/tools/remote-relay.py" "$pkgdir/usr/bin/bhaptics-remote-relay"
   local dll="$src/plugin/VestRumble/bin/Release/net46/VestRumble.dll"
   if [[ -f "$dll" ]]; then
     install -Dm644 "$dll" \

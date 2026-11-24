@@ -3,7 +3,7 @@ Description=bHaptics Player emulator (WebSocket -> BLE TactSuit)
 After=bluetooth.target
 
 [Service]
-ExecStart=/usr/bin/python /usr/lib/bhaptics-linux/player_daemon.py
+ExecStart=/usr/bin/python3 /usr/lib/bhaptics-linux/player_daemon.py
 Restart=on-failure
 RestartSec=5
 

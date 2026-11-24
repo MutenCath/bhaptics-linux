@@ -22,11 +22,11 @@ async def _rpc(messages):
     """One short-lived request/reply round-trip with the daemon."""
     import websockets
 
-    async with websockets.connect(URI, open_timeout=3) as ws:
-        status = json.loads(await ws.recv())
+    async with websockets.connect(URI, open_timeout=3, close_timeout=3) as ws:
+        status = json.loads(await asyncio.wait_for(ws.recv(), 5))
         for msg in messages:
             await ws.send(json.dumps(msg))
-            await ws.recv()
+            await asyncio.wait_for(ws.recv(), 5)
         return status
 
 
@@ -89,8 +89,10 @@ class TrayController:
 
     # ---- actions ----------------------------------------------------------
     def _send(self, message):
-        with contextlib.suppress(Exception):
+        try:
             asyncio.run(_rpc([message]))
+        except Exception as e:
+            print(f"tray: action failed: {e}", file=sys.stderr)
 
     def run_action(self, action):
         if action == "open_ui":
@@ -107,24 +109,30 @@ class TrayController:
             self._send({"Submit": [{"Type": "turnOffAll"}]})
         elif action == "quit":
             self.stop = True
+        else:
+            print(f"tray: unknown action {action!r}", file=sys.stderr)
 
 
 def _poll(controller, on_change):
     """Background poller; the daemon has no push that a tray can rely on."""
     signature = None
+    failures = 0
     while not controller.stop:
         try:
             status = asyncio.run(_rpc([]))
             controller.refresh(status)
+            failures = 0
         except Exception:
             controller.set_offline()
+            failures += 1
         # the title alone misses menu-only changes (audio on/off, source)
         sig = (controller.title, controller.menu_rows())
         if sig != signature:
             signature = sig
             with contextlib.suppress(Exception):
                 on_change()
-        time.sleep(2)
+        # back off when the daemon is unreachable: 2s -> 4s -> ... -> 30s
+        time.sleep(2 if not failures else min(30, 2 << min(failures, 3)))
 
 
 def _icon_image():
@@ -169,7 +177,14 @@ def main():
                 items.append(MenuItem(label, handler(action), enabled=enabled))
         return items
 
-    icon = pystray.Icon("bhaptics", _icon_image(), "bHaptics",
+    try:
+        image = _icon_image()
+    except ImportError:
+        print("tray: Pillow missing — install python-pillow for the tray icon",
+              file=sys.stderr)
+        return 2
+
+    icon = pystray.Icon("bhaptics", image, "bHaptics",
                         Menu(build_items))
     def on_change():
         icon.title = controller.title  # tooltip shows vest/battery/game
@@ -177,7 +192,12 @@ def main():
 
     threading.Thread(target=_poll,
                      args=(controller, on_change), daemon=True).start()
-    icon.run()
+    try:
+        icon.run()
+    except Exception as e:
+        print(f"tray: cannot show the tray icon (no display or AppIndicator?): {e}",
+              file=sys.stderr)
+        return 2
     return 0
 
 

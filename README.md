@@ -231,6 +231,8 @@ tools/remote-relay.py --list      # show what's on the LAN
 tools/remote-relay.py --host <ip> # fallback when broadcast can't cross (VLANs)
 ```
 
+(Installed as `bhaptics-remote-relay` by the Arch package.)
+
 Alternatively the gaming PC's own daemon can host: pick **Host haptics** in the
 web UI (or write `{"relay_host": true}` to `~/.config/bhaptics-linux/network.json`)
 and it forwards the games on that machine to the vest device, which only needs

@@ -426,17 +426,19 @@ def doctor(token, fix):
 
 
 async def rpc(messages, want=None, settle=0.0):
-    async with websockets.connect(URI, open_timeout=3) as ws:
-        status = json.loads(await ws.recv())
+    async with websockets.connect(URI, open_timeout=3, close_timeout=3) as ws:
+        status = json.loads(await asyncio.wait_for(ws.recv(), 5))
         for msg in messages:
             await ws.send(json.dumps(msg))
-            reply = json.loads(await ws.recv())
+            reply = json.loads(await asyncio.wait_for(ws.recv(), 5))
             if "RegisteredKeys" in reply:
                 status = reply
             if want and want in reply:
                 return reply, status
         if settle:
             await asyncio.sleep(settle)
+        if want:
+            raise ConnectionError(f"daemon never sent a {want} reply")
         return None, status
 
 
@@ -636,7 +638,14 @@ def doctor_json(target, fix):
     """Machine-readable reports for the daemon/UI. target=None scans all."""
     out = []
     for appid in ([target] if target else iter_bhaptics_games()):
-        report, todo = diagnose(appid)
+        try:
+            report, todo = diagnose(appid)
+        except Exception as e:
+            # one unreadable game must not corrupt the whole JSON stream
+            out.append({"appid": str(appid), "name": str(appid), "ok": False,
+                        "kind": "error", "issues": [f"diagnose failed: {e}"],
+                        "manual": [], "notes": []})
+            continue
         if report is None or report.get("kind") == "none":
             continue
         if fix:
@@ -654,6 +663,18 @@ def doctor_json(target, fix):
     print(json.dumps(out))
 
 
+def _bounded(lo, hi):
+    def parse(v):
+        try:
+            n = int(v)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{v!r} is not a number") from None
+        if not lo <= n <= hi:
+            raise argparse.ArgumentTypeError(f"must be between {lo} and {hi}")
+        return n
+    return parse
+
+
 def main():
     ap = argparse.ArgumentParser(prog="vestctl", description="Control the bHaptics vest daemon")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -661,8 +682,8 @@ def main():
     sub.add_parser("status", help="vest/audio/game status")
     p = sub.add_parser("pulse", help="buzz the vest")
     p.add_argument("where", nargs="?", default="all", choices=["all", "front", "back"])
-    p.add_argument("-i", "--intensity", type=int, default=60, help="0-100")
-    p.add_argument("-d", "--duration", type=int, default=300, help="ms")
+    p.add_argument("-i", "--intensity", type=_bounded(0, 100), default=60, help="0-100")
+    p.add_argument("-d", "--duration", type=_bounded(1, 10000), default=300, help="ms")
     sub.add_parser("stop", help="stop all effects")
     sub.add_parser("wake", help="reconnect a vest that went to sleep when idle")
     p = sub.add_parser("audio", help="audio mode on/off")
@@ -672,8 +693,8 @@ def main():
     p = sub.add_parser("pad", help="gamepad rumble mirror on/off")
     p.add_argument("state", choices=["on", "off"])
     p = sub.add_parser("feel", help="show/tune how effects turn into motor power")
-    p.add_argument("--strength", type=int, metavar="PCT", help="master strength 25-200 %%")
-    p.add_argument("--floor", type=int, metavar="N", help="minimum motor level 0-6 (0 = off)")
+    p.add_argument("--strength", type=_bounded(25, 200), metavar="PCT", help="master strength 25-200 %%")
+    p.add_argument("--floor", type=_bounded(0, 6), metavar="N", help="minimum motor level 0-6 (0 = off)")
     p.add_argument("--smooth", choices=["on", "off"], help="dithered finer intensity steps")
     p.add_argument("--punch", choices=["on", "off"], help="20 ms kick when a motor starts")
     p.add_argument("--test", action="store_true", help="play the feel test afterwards")
@@ -726,11 +747,11 @@ def main():
     async def run():
         if args.cmd == "status":
             _, st = await rpc([])
-            vest = "connected" if st["ConnectedDeviceCount"] else "NOT FOUND"
-            if not st["ConnectedDeviceCount"] and st.get("VestIdle"):
+            vest = "connected" if st.get("ConnectedDeviceCount") else "NOT FOUND"
+            if not st.get("ConnectedDeviceCount") and st.get("VestIdle"):
                 vest = "asleep (vestctl wake, or switch the vest off and on)"
             bat = f" battery {st['Battery']}%" if st.get("Battery") is not None else ""
-            audio = "on" if st["AudioMode"] else "off"
+            audio = "on" if st.get("AudioMode") else "off"
             if st.get("AudioSuppressed"):
                 audio += " (paused: game active)"
             auto = "on" if st.get("AudioAuto") else "off"
@@ -740,7 +761,7 @@ def main():
             if st.get("PadDevices"):
                 pad += f" ({', '.join(st['PadDevices'])})"
             print(f"vest: {vest}{bat}")
-            src = st["AudioSource"]
+            src = st.get("AudioSource", "?")
             if src == "auto":
                 src = "games-only (auto)"
             print(f"audio: {audio}  source: {src}  preset: {st['ActivePreset'] or '-'}")
@@ -864,13 +885,13 @@ def main():
                 msgs.append({"ImportTact": {"name": f.stem, "project": data}})
             if not msgs:
                 sys.exit("vestctl: no readable .tact/.json files found")
-            async with websockets.connect(URI, open_timeout=3) as ws:
-                await ws.recv()  # initial status
+            async with websockets.connect(URI, open_timeout=3, close_timeout=3) as ws:
+                await asyncio.wait_for(ws.recv(), 5)  # initial status
                 for m in msgs:
                     await ws.send(json.dumps(m))
                 got = 0
                 while got < len(msgs):
-                    r = json.loads(await ws.recv())
+                    r = json.loads(await asyncio.wait_for(ws.recv(), 10))
                     if "ImportNote" in r:
                         print(r["ImportNote"])
                         got += 1
@@ -881,7 +902,8 @@ def main():
 
     try:
         asyncio.run(run())
-    except (OSError, asyncio.TimeoutError):
+    except (OSError, asyncio.TimeoutError,
+            websockets.exceptions.WebSocketException):
         print("vestctl: daemon unreachable on ws://127.0.0.1:15881 — is bhaptics-daemon running?",
               file=sys.stderr)
         sys.exit(1)
