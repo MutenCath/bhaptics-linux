@@ -128,11 +128,21 @@ That creates a venv, installs deps (bleak, websockets, numpy), and sets up a
 to any BLE device named `TactSuit*`/`Tactot*`. Re-run `install.sh` after
 moving the folder. Open the UI, click a grid cell, feel the buzz.
 
+Minimal distros and handhelds (SteamOS on the Deck or the Steam Frame,
+fresh Debian installs) are covered: if the OS Python has no pip/ensurepip the
+installer bootstraps pip into the venv itself, and it tells you which distro
+package to install only when it truly can't proceed. The one dependency that
+can't always come along is `evdev` (the gamepad rumble mirror) — it builds
+from source and needs gcc + Python headers, so on a read-only or minimal
+system it's skipped with a note and everything else still works. ARM64 is
+fine: bleak is pure Python and websockets/numpy ship aarch64 wheels.
+
 Because it installs a **user** service, run it from a terminal inside your
 graphical login session as your normal user — not over SSH and not with
 `sudo`. (On SteamOS, run it from Desktop Mode; the installer repairs a
 nested-session `XDG_RUNTIME_DIR` automatically.) Note that SteamOS's
-read-only rootfs means the `makepkg` route below won't survive an OS update.
+read-only rootfs means the `makepkg` route below won't survive an OS update —
+everything `./install.sh` touches lives in your home directory, so it does.
 
 Settings live in `~/.config/bhaptics-linux/` (mapping, presets, learned
 per-app settings, effects, patterns) and `~/.local/state/bhaptics-linux/`
