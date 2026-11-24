@@ -1,0 +1,11 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_NOVENDOR_bhaptics_capture",
+    "library_path": "./libXrApiLayer_bhaptics.so",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "bhaptics-linux PoC: captures xrApplyHapticFeedback/xrStopHapticFeedback and mirrors taps to the bhaptics-linux daemon as OSC (/vest/tap) over UDP 127.0.0.1:9001",
+    "disable_environment": "DISABLE_BHAPTICS_XR_LAYER"
+  }
+}

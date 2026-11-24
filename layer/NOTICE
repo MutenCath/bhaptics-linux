@@ -1,0 +1,30 @@
+NOTICE — vendored Khronos OpenXR headers
+========================================
+
+This directory vendors the following unmodified files from the Khronos
+Group OpenXR-SDK repository, pinned at tag release-1.1.43:
+
+    vendor/openxr/openxr.h
+    vendor/openxr/openxr_platform.h
+    vendor/openxr/openxr_platform_defines.h
+    vendor/openxr/openxr_loader_negotiation.h
+
+Source:
+    https://github.com/KhronosGroup/OpenXR-SDK/tree/release-1.1.43/include/openxr
+    (fetched from
+     https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/release-1.1.43/include/openxr/)
+
+Copyright:
+    Copyright 2017-2024, The Khronos Group Inc.
+
+License:
+    Apache-2.0 (dual-licensed "Apache-2.0 OR MIT" per the SPDX headers in
+    each file):
+    https://www.apache.org/licenses/LICENSE-2.0
+
+openxr_reflection.h is intentionally NOT vendored: this layer uses a
+hand-written dispatch and does not need it.
+
+The rest of layer/ (bhaptics_xr_layer.c, test_layer.c, Makefile,
+manifest.json, README.md) is original code under the repository's
+GPL-3.0-or-later license.

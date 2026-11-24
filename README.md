@@ -102,6 +102,12 @@ project does it.
   Input System) and mirrors them to the vest as side-aware chest taps.
   Pairs with audio mode for a surprisingly complete fake integration.
   Mono Unity only for now; refuses anti-cheat games outright.
+- **OpenXR haptics capture (experimental)** — `layer/` builds an implicit
+  OpenXR API layer that mirrors every `xrApplyHapticFeedback` to the vest
+  via OSC, for any OpenXR game with no mod at all — including Windows VR
+  titles under Proton (their wineopenxr loads the *native* OpenXR loader,
+  so native layers apply). PoC status: ABI-tested, needs real-game soak.
+  See `layer/README.md`.
 - **Gamepad rumble mirror** — for flat games: the daemon wraps your
   FF-capable gamepad in a virtual copy; rumble still reaches the pad *and*
   buzzes the belly/mid rows. No game files involved at all. Toggle in the
